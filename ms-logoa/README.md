@@ -1,4 +1,4 @@
-# Match Simulator Club Logos (private)
+# Match Simulator Club Logos (public)
 
 Works on Windows, macOS and Linux, in Google Chrome (and other Chromium browsers such as Edge/Brave) and Firefox.
 Same code for both; only the manifest differs (`manifest.json` = Chrome, `manifest.firefox.json` = Firefox).
