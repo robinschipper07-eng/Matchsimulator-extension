@@ -434,10 +434,99 @@ function findByMatchTitle(logo) {
   for (let i = 0; i < 5 && node && node !== document.body; i++, node = node.parentElement) {
     const text = (node.textContent || "").toLowerCase();
     const hits = teams.filter((n) => text.includes(n.toLowerCase()));
-    if (hits.length === 1) return { key: "n:" + hits[0].toLowerCase(), name: hits[0] };
+    if (hits.length === 1) {
+      const side = teams.indexOf(hits[0]) === 0 ? "home" : "away";
+      return idClub(side, hits[0]) || { key: "n:" + hits[0].toLowerCase(), name: hits[0] };
+    }
     if (hits.length > 1) break; // container holds both clubs: ambiguous
   }
   return null;
+}
+
+// ---------- tracking clubs by their id on match / lineup pages ----------
+// Match and lineup-editor pages show names but no ids. Pages that do carry ids
+// (cup fixture tables, team lists) are learned from, so the logo of a match page
+// uses the same per-club id key as everywhere else:
+//  1. a fixture row links "/match/<hash>/..." and holds both team links: hash -> both clubs
+//  2. pressing Simulate / Edit line-ups in such a row remembers that pair for the page that opens next
+const fixtureTeams = makeStore("fixtureTeams1"); // match hash -> [homeKey, homeName, awayKey, awayName]
+const PENDING_KEY = "msPendingPair";
+// the store compares values with !==, so a list is kept as one string
+const FX_SEP = "\u241f";
+const fxGet = (h) => {
+  const v = fixtureTeams.get(h);
+  const parts = typeof v === "string" && v !== "?" ? v.split(FX_SEP) : null;
+  return parts && parts.length === 4 ? parts : null;
+};
+const fxSet = (h, teams) => fixtureTeams.set(h, teams.join(FX_SEP));
+
+const slugOf = (s) => nameKey(s).replace(/[^a-z0-9]+/g, "");
+const sameClubName = (a, b) => {
+  const x = slugOf(a), y = slugOf(b);
+  return !!x && !!y && (x === y || (x.length >= 4 && y.includes(x)) || (y.length >= 4 && x.includes(y)));
+};
+
+function teamsFromRow(row) {
+  if (!row) return null;
+  const seen = new Map();
+  for (const a of row.querySelectorAll(LINK_SELECTOR)) {
+    const t = teamFromAnchor(a);
+    if (t && !seen.has(t.key)) seen.set(t.key, t);
+    if (seen.size === 2) break;
+  }
+  const list = [...seen.values()];
+  return list.length === 2 ? [list[0].key, list[0].name, list[1].key, list[1].name] : null;
+}
+
+function learnFixtures() {
+  document.querySelectorAll('a[href*="/match/"]').forEach((a) => {
+    const m = /\/match\/([0-9a-f]{8,})\//.exec(a.getAttribute("href") || "");
+    if (!m || fxGet(m[1])) return;
+    const teams = teamsFromRow(a.closest("tr, li, .fixture, .match-row"));
+    if (teams) fxSet(m[1], teams);
+  });
+}
+
+document.addEventListener(
+  "click",
+  (e) => {
+    const btn = e.target.closest && e.target.closest('button[onclick*="simulateMatch"], [onclick*="simulateMatch"]');
+    if (!btn) return;
+    const teams = teamsFromRow(btn.closest("tr"));
+    if (!teams) return;
+    try {
+      localStorage.setItem(PENDING_KEY, JSON.stringify({ t: Date.now(), teams }));
+    } catch (err) {}
+  },
+  true
+);
+
+function pageHash() {
+  const m = /^\/match\/([0-9a-f]{8,})\//.exec(location.pathname);
+  return m ? m[1] : null;
+}
+
+// The club behind the home/away side of the current match page, by id key.
+function idClub(side, pageName) {
+  const i = side === "home" ? 0 : 2;
+  const h = pageHash();
+  let teams = h ? fxGet(h) : null;
+  let fromPending = false;
+  if (!teams) {
+    try {
+      const p = JSON.parse(localStorage.getItem(PENDING_KEY) || "null");
+      if (p && Date.now() - p.t < 15 * 60 * 1000) {
+        teams = p.teams;
+        fromPending = true;
+      }
+    } catch (e) {}
+  }
+  if (!teams || !sameClubName(teams[i + 1], pageName)) return null;
+  if (fromPending && h) {
+    const names = homeAwayNamesFromPage() || matchTeams();
+    if (names && sameClubName(teams[1], names[0]) && sameClubName(teams[3], names[1])) fxSet(h, teams);
+  }
+  return { key: teams[i], name: pageName };
 }
 
 function findClubRaw(logo) {
@@ -479,7 +568,7 @@ function findClubRaw(logo) {
     const names = homeAwayNamesFromPage() || matchTeams();
     if (names) {
       const name = side === "home" ? names[0] : names[1];
-      return { key: "n:" + name.toLowerCase(), name };
+      return idClub(side, name) || { key: "n:" + name.toLowerCase(), name };
     }
   }
   // 4. Match pages: use the clubs named in the page title, paired up by position
@@ -812,6 +901,7 @@ const io = new IntersectionObserver(
 
 function scan() {
   if (!ready || disabled) return;
+  learnFixtures();
   document.querySelectorAll('img[src*="/img/flags/"]:not([data-ms-flag])').forEach(processFlagImg);
   document.querySelectorAll(LOGO_SELECTOR).forEach((logo) => {
     if (logo.dataset[MARK]) {
@@ -1279,7 +1369,7 @@ let settings = { mode: "auto", premium: null };
 const computeDisabled = () => settings.mode === "off" || (settings.mode === "auto" && settings.premium === true);
 
 function detectPremium() {
-  if (loaded < 3 || settings.mode !== "auto") return; // wait until the saved settings are read
+  if (loaded < 4 || settings.mode !== "auto") return; // wait until the saved settings are read
   let found = null;
   if (document.querySelector('[data-bs-target="#premiumRequiredModal"]')) {
     found = false; // a premium-locked control is on screen: no premium
@@ -1367,7 +1457,7 @@ document.addEventListener("keydown", (e) => {
 
 let loaded = 0;
 const onLoaded = () => {
-  if (++loaded < 3) return;
+  if (++loaded < 4) return;
   disabled = computeDisabled();
   if (disabled) return;
   ready = true;
@@ -1375,6 +1465,7 @@ const onLoaded = () => {
 };
 knownClubs.load(onLoaded);
 flagIds.load(onLoaded);
+fixtureTeams.load(onLoaded);
 try {
   chrome.storage.local.get("msSettings", (r) => {
     if (r && r.msSettings) settings = Object.assign(settings, r.msSettings);
