@@ -1,15 +1,19 @@
 {
   "manifest_version": 3,
-  "name": "Match Simulator Club Logos (Public)",
-  "version": "2.0",
+  "name": "Match Simulator Club Logos (private)",
+  "version": "2.1",
   "description": "Adds real-life club logos and nation flags on matchsimulator.com. For personal use.",
-  "permissions": ["storage"],
+  "permissions": [
+    "storage"
+  ],
   "host_permissions": [
     "https://en.wikipedia.org/*",
     "https://commons.wikimedia.org/*",
     "https://upload.wikimedia.org/*",
     "https://www.thesportsdb.com/*",
-    "https://r2.thesportsdb.com/*"
+    "https://r2.thesportsdb.com/*",
+    "https://fminside.net/*",
+    "https://img.fminside.net/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -20,8 +24,11 @@
         "https://matchsimulator.com/*",
         "https://www.matchsimulator.com/*"
       ],
-      "js": ["content.js"],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_idle"
     }
-  ]
+  ],
+  "minimum_chrome_version": "116"
 }

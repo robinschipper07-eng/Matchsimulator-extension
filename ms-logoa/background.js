@@ -15,7 +15,7 @@ const WIKI_API = "https://en.wikipedia.org/w/api.php";
 const SPORTS_SPACING_MS = 2200; // TheSportsDB free tier: about 30 requests/minute
 const WIKI_SPACING_MS = 250;
 
-const CACHE_KEY = "badgeCache5"; // automatic results (bumped: stricter colour fallback)
+const CACHE_KEY = "badgeCache6"; // automatic results (bumped: stricter colour fallback)
 const OVERRIDE_KEY = "badgeOverrides"; // your manual corrections (never expire)
 const CLAIM_KEY = "logoClaims"; // which club owns which logo
 
@@ -68,8 +68,13 @@ const saveClaims = () => chrome.storage.local.set({ [CLAIM_KEY]: claims });
 
 // ---------- names ----------
 
+// "A.S. Arue" / "S.C. Braga" -> "AS Arue" / "SC Braga", so initials search as one word.
+const joinInitials = (s) => String(s || "").replace(/\b(?:[A-Za-z]\.){2,}/g, (m) => m.replace(/\./g, ""));
+
+const MOD_TAG = /\s*[\[(]\s*(?:mod|modded|custom|fictional)\s*[\])]/gi;
+
 function norm(s) {
-  const base = stripAccents(s)
+  const base = stripAccents(joinInitials(String(s || "").replace(MOD_TAG, "")))
     .toLowerCase()
     .replace(/\([^)]*\)/g, " ")
     .replace(/&/g, " and ")
@@ -133,6 +138,7 @@ function family(name) {
 }
 
 function queryList(name) {
+  name = joinInitials(String(name || "").replace(MOD_TAG, "")).trim();
   const out = [];
   const alias = ALIASES[name.toLowerCase()];
   if (alias) out.push(alias);
@@ -239,6 +245,8 @@ async function wikiSearch(q) {
       .sort((a, b) => a.index - b.index)
       // logos are svg/png files; photos (jpg) are skipped
       .filter((p) => p.thumbnail && /\.(svg|png)$/i.test(p.pageimage || ""))
+      // songs, albums, people etc. are not clubs ("Arue (song)")
+      .filter((p) => !/\((?:song|album|single|ep|band|film|novel|musician|singer|rapper|tv|television|surname|given name|disambiguation|footballer|politician)[^)]*\)/i.test(p.title || ""))
       .map((p) => ({ url: p.thumbnail.source, label: p.title, source: "wikipedia" }));
   } catch (e) {
     return "RETRY";
@@ -279,6 +287,78 @@ async function sportsCandidates(name) {
   return out;
 }
 
+// ---------- FMInside (football manager database) ----------
+// Club logos at img.fminside.net/logos/<version>/Clubs/Normal/<uid>_club.png, found through
+// the club list's name filter. FM uses short names ("Man City", "R. Madrid"), so the
+// name score expands abbreviations instead of comparing plain strings.
+const FM_LIST = "https://fminside.net/clubs";
+const FM_SPACING_MS = 500;
+const fmQueryCache = new Map();
+const CLUB_WORDS = new Set(["fc", "afc", "cf", "sc", "ac", "as", "ss", "rc", "cd", "ud", "sd", "fk", "sk", "bk", "if", "cs", "us", "ud"]);
+
+const unEntity = (s) =>
+  s.replace(/&#0*39;|&apos;/g, "'").replace(/&quot;/g, '"').replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+   .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n));
+
+async function fmSearch(q) {
+  if (fmQueryCache.has(q)) return fmQueryCache.get(q);
+  let out = [];
+  try {
+    const res = await fetch(`${FM_LIST}?page=clubs&gender=1&name=${encodeURIComponent(q)}`, { credentials: "omit" });
+    if (res.ok) {
+      const html = await res.text();
+      const re = /src="((?:https?:)?\/\/img\.fminside\.net\/logos\/[^"?]*\/Clubs\/Normal\/\d+_club\.png)[^"]*"[\s\S]{0,400}?<span class="name"><b><a [^>]*>([^<]+)<\/a>/g;
+      let m;
+      while ((m = re.exec(html))) {
+        const url = m[1].startsWith("//") ? "https:" + m[1] : m[1];
+        out.push({ url, label: unEntity(m[2].trim()), source: "fminside" });
+      }
+    }
+  } catch (e) {}
+  fmQueryCache.set(q, out);
+  return out;
+}
+
+function fmNameScore(wantedNorm, fmName) {
+  const strip = (t) => t.filter((w) => w && !CLUB_WORDS.has(w));
+  const f = strip(norm(fmName).split(" "));
+  const w = strip(wantedNorm.split(" "));
+  if (!f.length || !w.length) return 0;
+  const used = new Set();
+  let matched = 0;
+  for (const ft of f) {
+    const i = w.findIndex((wt, idx) => !used.has(idx) && (wt === ft || wt.startsWith(ft)));
+    if (i >= 0) { used.add(i); matched++; }
+  }
+  const plain = sim(wantedNorm, norm(fmName));
+  // an acronym like "PSG" = Paris Saint Germain
+  if (f.length === 1 && f[0].length >= 2 && f[0] === w.map((t) => t[0]).join("")) return 0.9;
+  if (matched === 0) return plain;
+  const score = (matched / f.length) * (0.5 + 0.5 * (used.size / w.length));
+  // plain string similarity only counts when every FM word was matched ("A. Madrid" is not "Real Madrid")
+  return Math.min(0.99, matched === f.length ? Math.max(plain, score) : score);
+}
+
+async function fmCandidates(name) {
+  const wanted = norm(name);
+  const words = wanted.split(" ").filter((x) => x.length >= 3 && !CLUB_WORDS.has(x)).sort((a, b) => b.length - a.length);
+  const queries = [...new Set([name, ...words.slice(0, 2)])];
+  const out = [];
+  const seen = new Set();
+  for (const q of queries) {
+    const list = await fmSearch(q);
+    for (const c of list) {
+      if (seen.has(c.url)) continue;
+      seen.add(c.url);
+      c.nameScore = fmNameScore(wanted, c.label);
+      out.push(c);
+    }
+    if (out.some((c) => c.nameScore >= NAME_OK)) break;
+    await sleep(FM_SPACING_MS);
+  }
+  return out;
+}
+
 // ---------- choosing the logo ----------
 
 // Returns {url, matched, score, nameScore, colorScore, via, from} or "RETRY"
@@ -299,7 +379,7 @@ async function chooseLogo(name, colors, nk) {
       if (!c.url || seen.has(c.url)) continue;
       seen.add(c.url);
       const names = [c.label, ...String(c.alt || "").split(",")].map((s) => norm(s.trim())).filter(Boolean);
-      c.nameScore = Math.max(0, ...names.map((n) => sim(wanted, n)));
+      c.nameScore = c.nameScore != null ? c.nameScore : Math.max(0, ...names.map((n) => sim(wanted, n)));
       c.colorScore = null;
       cands.push(c);
       fresh.push(c);
@@ -339,9 +419,15 @@ async function chooseLogo(name, colors, nk) {
 
   const q = ALIASES[name.toLowerCase()] || name;
 
-  // Round 1: Wikipedia
-  await add(await wikiSearch(q + " football club"));
+  // Round 0: FMInside (preferred source)
+  await add(await fmCandidates(name));
   let best = pick();
+
+  // Round 1: Wikipedia
+  if (!best) {
+    await add(await wikiSearch(q + " football club"));
+    best = pick();
+  }
 
   // Round 2: wider pool, then pick by name + colours (or colours alone)
   if (!best) {
@@ -546,6 +632,7 @@ async function loadClubInfo(name) {
 }
 
 function clubInfo(name) {
+  name = String(name || "").replace(MOD_TAG, "").trim();
   const key = norm(name);
   if (!clubInfoCache.has(key)) clubInfoCache.set(key, loadClubInfo(name));
   return clubInfoCache.get(key);

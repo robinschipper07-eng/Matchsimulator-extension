@@ -320,7 +320,7 @@ im|Isle of Man
 es-ct|Catalonia`;
 
 const natKey = (s) =>
-  nameKey(s).replace(/[.\u2019'`]/g, "").replace(/[-\u2013]/g, " ").replace(/\s+/g, " ").trim();
+  nameKey(String(s || "").replace(/\s*[\[(]\s*(?:mod|modded|custom|fictional)\s*[\])]/gi, "")).replace(/[.\u2019'`]/g, "").replace(/[-\u2013]/g, " ").replace(/\s+/g, " ").trim();
 
 const NATIONS = new Map();
 for (const line of NATION_DATA.split("\n")) {
@@ -440,6 +440,24 @@ function findByMatchTitle(logo) {
 }
 
 function findClubRaw(logo) {
+  // 0. Team lists (logo packs / customization packs): each row is
+  //    <div id="teamContainer_<id>"> - that id is the club's own id, so every
+  //    club gets its own key ("t<id>:<name>", the same scheme as team links).
+  const row = logo.closest('[id^="teamContainer_"]');
+  if (row) {
+    const id = row.id.replace(/^teamContainer_/, "");
+    let name = "";
+    for (const el of row.querySelectorAll(".card-body div, .card-body span")) {
+      if (el.matches(LOGO_SELECTOR) || el.querySelector(LOGO_SELECTOR) || el.closest(LOGO_SELECTOR)) continue;
+      if (el.querySelector("button, svg")) continue;
+      const t = cleanName(el.textContent);
+      if (plausible(t, 2) && !el.firstElementChild) { name = t; break; }
+    }
+    if (id && name) {
+      const slugKey = name.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "-").replace(/^-+|-+$/g, "");
+      return { key: "t" + id + (slugKey ? ":" + slugKey : ""), name };
+    }
+  }
   // 1. The crest sits inside a team/nation link
   const own = logo.closest(LINK_SELECTOR);
   if (own) {
@@ -488,8 +506,13 @@ function findClubRaw(logo) {
   return null;
 }
 
+// Modded teams show up as "Portland Hearts of Pine [Mod]"; the tag must not
+// reach the Wikipedia/flag lookups. The key keeps the tag, so corrections stay per modded club.
+const stripTag = (s) => cleanName(String(s || "").replace(/\s*[\[(]\s*(?:mod|modded|custom|fictional)\s*[\])]/gi, ""));
+
 function findClub(logo) {
-  const club = findClubRaw(logo);
+  const raw = findClubRaw(logo);
+  const club = raw && { ...raw, name: stripTag(raw.name) || raw.name };
   if (!club) return null;
   if (club.key[0] === "t") {
     // remember name -> key so name-only pages (match pages) share corrections
@@ -1175,169 +1198,6 @@ function processLineupCards() {
   });
 }
 
-// "Team of the Tournament": the best-rated player in each line (GK/DEF/MID/FWD)
-// from matches you've viewed that belong to a given cup. Only this browser,
-// only matches actually opened - not a full record of every match simulated.
-
-function cupIdOnPage() {
-  const own = /^\/cup\/(\d+)\//.exec(location.pathname);
-  if (own) return own[1];
-  for (const a of document.querySelectorAll('a[href^="/cup/"]')) {
-    const m = /^\/cup\/(\d+)\//.exec(a.getAttribute("href") || "");
-    if (m) return m[1];
-  }
-  return null;
-}
-
-function positionBand(y) {
-  if (y === null) return "MID";
-  if (y >= 80) return "GK";
-  if (y >= 55) return "DEF";
-  if (y >= 25) return "MID";
-  return "FWD";
-}
-
-// Reads the current ratings shown on a match's Lineups pitch
-function extractMatchRatings() {
-  const wrappers = document.querySelectorAll(".player-wrapper");
-  if (!wrappers.length) return [];
-  const names = homeAwayNamesFromPage() || matchTeams();
-  if (!names) return [];
-  const out = [];
-  wrappers.forEach((w) => {
-    const nameEl = w.querySelector(".player-name");
-    const ratingEl = w.querySelector(".match-rating");
-    const achEl = w.querySelector('[id^="player"]');
-    if (!nameEl || !ratingEl || !achEl) return;
-    const rating = parseFloat(cleanName(ratingEl.textContent));
-    if (!isFinite(rating)) return;
-    const side = /^playerH/.test(achEl.id) ? "home" : /^playerA/.test(achEl.id) ? "away" : null;
-    if (!side) return;
-    const my = /--y:\s*([\d.]+)/.exec(w.getAttribute("style") || "");
-    out.push({
-      player: cleanName(nameEl.textContent),
-      team: side === "home" ? names[0] : names[1],
-      rating,
-      band: positionBand(my ? parseFloat(my[1]) : null),
-    });
-  });
-  return out;
-}
-
-function trackMatchRatings() {
-  const recs = extractMatchRatings();
-  if (!recs.length) return;
-  const cup = cupIdOnPage();
-  const key = "totw_all";
-  chrome.storage.local.get(key, (r) => {
-    const data = (r && r[key]) || {};
-    let changed = false;
-    for (const rec of recs) {
-      const k = rec.team + "|" + rec.player;
-      if (!data[k] || rec.rating > data[k].rating) {
-        data[k] = { ...rec, cup };
-        changed = true;
-      }
-    }
-    if (changed) chrome.storage.local.set({ [key]: data });
-  });
-}
-
-// One combined pool for every cup. Old per-cup keys (totw_<id>) are merged in once.
-function loadAllRatings(done) {
-  chrome.storage.local.get(null, (all) => {
-    const data = Object.assign({}, (all && all.totw_all) || {});
-    const legacy = Object.keys(all || {}).filter((k) => /^totw_\d+$/.test(k));
-    legacy.forEach((lk) => {
-      const cup = lk.slice(5);
-      for (const [k, rec] of Object.entries(all[lk] || {})) {
-        if (!data[k] || rec.rating > data[k].rating) data[k] = { ...rec, cup };
-      }
-    });
-    if (legacy.length) {
-      chrome.storage.local.set({ totw_all: data }, () => chrome.storage.local.remove(legacy));
-    }
-    done(data);
-  });
-}
-
-// Finds the card/section whose heading matches, e.g. "Comments" or "Player availability".
-function sectionByHeading(re) {
-  const heads = document.querySelectorAll("h1,h2,h3,h4,h5,h6,.card-header,legend,.nav-link,.card-title");
-  for (const h of heads) {
-    if (h.closest("#ms-totw-wrap")) continue;
-    if (re.test(cleanName(h.textContent))) return h.closest(".card") || h.closest("section") || h;
-  }
-  return null;
-}
-
-// Keeps the box above the comments section and under player availability.
-function placeTotw() {
-  const wrap = document.getElementById("ms-totw-wrap");
-  if (!wrap) return;
-  const comments = sectionByHeading(/^comments?\b/i);
-  if (comments) {
-    if (wrap.nextElementSibling !== comments) comments.parentNode.insertBefore(wrap, comments);
-    return;
-  }
-  const avail = sectionByHeading(/player availability|availability/i);
-  if (avail) {
-    if (wrap.previousElementSibling !== avail) avail.insertAdjacentElement("afterend", wrap);
-  }
-}
-
-function buildTotwBox(id, title, note, entries) {
-  const bands = { GK: [], DEF: [], MID: [], FWD: [] };
-  entries.forEach((e) => bands[e.band] && bands[e.band].push(e));
-  Object.values(bands).forEach((list) => list.sort((a, b) => b.rating - a.rating));
-  const xi = [...bands.GK.slice(0, 1), ...bands.DEF.slice(0, 4), ...bands.MID.slice(0, 3), ...bands.FWD.slice(0, 3)];
-  if (!xi.length) return null;
-  const box = document.createElement("div");
-  box.id = id;
-  box.className = "ms-totw";
-  box.style.cssText =
-    "margin:16px 0;padding:12px 14px;border:1px solid rgba(127,127,127,.35);" +
-    "border-radius:8px;background:rgba(127,127,127,.06);font-size:14px;line-height:1.5;";
-  const head = document.createElement("div");
-  head.innerHTML = "<strong>\u{1F3C5} " + title + '</strong> <span style="font-size:11px;opacity:.6;">' + note + "</span>";
-  const list = document.createElement("div");
-  list.style.cssText = "margin-top:6px;display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:4px 12px;";
-  xi.forEach((e) => {
-    const row = document.createElement("div");
-    row.textContent = `${e.band} \u2013 ${e.player} (${e.team}) ${e.rating.toFixed(1)}`;
-    if (e.cup) row.title = "Cup " + e.cup;
-    list.appendChild(row);
-  });
-  box.append(head, list);
-  return box;
-}
-
-// Two boxes at the bottom of a cup page: this cup on its own, and all cups together.
-function renderTeamOfTournament() {
-  const m = /^\/cup\/(\d+)\//.exec(location.pathname);
-  if (!m || document.getElementById("ms-totw-wrap")) return;
-  loadAllRatings((data) => {
-    if (document.getElementById("ms-totw-wrap")) return;
-    const all = Object.values(data);
-    if (!all.length) return;
-    const wrap = document.createElement("div");
-    wrap.id = "ms-totw-wrap";
-    wrap.style.cssText = "margin:12px auto;padding:0 12px;max-width:1200px;";
-    const mine = buildTotwBox(
-      "ms-totw-cup", "Team of the Matchday \u2013 this cup", "(only this cup, from matches you've viewed)",
-      all.filter((e) => String(e.cup) === m[1])
-    );
-    const every = buildTotwBox(
-      "ms-totw-all", "Team of the Matchday \u2013 all cups", "(all cups together, from matches you've viewed)", all
-    );
-    if (mine) wrap.appendChild(mine);
-    if (every) wrap.appendChild(every);
-    if (!wrap.children.length) return;
-    document.body.appendChild(wrap);
-    placeTotw();
-  });
-}
-
 // Wikipedia lists the location as "City, Region, Country"; take the city.
 function pickPlace(parts, stadium) {
   const ok = (parts || []).filter(
@@ -1375,17 +1235,6 @@ function fillStadium() {
   });
 }
 
-// When ratings from another cup/match are saved, rebuild the box instead of
-// keeping the stale one this page drew first.
-try {
-  chrome.storage.onChanged.addListener((ch, area) => {
-    if (area !== "local" || !ch.totw_all) return;
-    const old = document.getElementById("ms-totw-wrap");
-    if (old) old.remove();
-    renderTeamOfTournament();
-  });
-} catch (e) {}
-
 let timer = null;
 new MutationObserver(() => {
   clearTimeout(timer);
@@ -1394,10 +1243,7 @@ new MutationObserver(() => {
     fillStadium();
     processLineupCards();
     processEditorPage();
-    placeTotw();
     reapplyCaptains();
-    trackMatchRatings();
-    renderTeamOfTournament();
   }, 300);
 }).observe(document.body, { childList: true, subtree: true });
 
@@ -1428,10 +1274,7 @@ setTimeout(() => {
   fillStadium();
   processLineupCards();
   processEditorPage();
-  placeTotw();
   reapplyCaptains();
-  trackMatchRatings();
-  renderTeamOfTournament();
 }, 1000);
 
 if (DEBUG) {
