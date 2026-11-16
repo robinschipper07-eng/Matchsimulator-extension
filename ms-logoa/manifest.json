@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Match Simulator Club Logos (private)",
+  "name": "Match Simulator Club Logos (Public)",
   "version": "2.0",
   "description": "Adds real-life club logos and nation flags on matchsimulator.com. For personal use.",
   "permissions": ["storage"],
