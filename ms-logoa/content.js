@@ -33,6 +33,7 @@ const warned = new WeakSet();
 const observed = new WeakSet();
 const pending = new Map(); // club key -> Promise of badge info
 let ready = false;
+let disabled = false; // true while the extension is switched off (premium account or manual setting)
 
 function cleanName(s) {
   return (s || "").replace(/\s+/g, " ").trim();
@@ -744,6 +745,7 @@ function fixtureSlugTeams(img) {
 }
 
 async function processFlagImg(img) {
+  if (disabled) return;
   let code = null;
   let bestName = null;
   const tryName = (t) => {
@@ -809,7 +811,7 @@ const io = new IntersectionObserver(
 );
 
 function scan() {
-  if (!ready) return;
+  if (!ready || disabled) return;
   document.querySelectorAll('img[src*="/img/flags/"]:not([data-ms-flag])').forEach(processFlagImg);
   document.querySelectorAll(LOGO_SELECTOR).forEach((logo) => {
     if (logo.dataset[MARK]) {
@@ -955,8 +957,9 @@ function openPicker(logo) {
   const resetBtn = el("button", "padding:6px 10px;cursor:pointer;", "Reset to automatic");
   const exportBtn = el("button", "padding:6px 10px;cursor:pointer;", "Export all corrections");
   const importBtn = el("button", "padding:6px 10px;cursor:pointer;", "Import corrections");
+  const resetAllBtn = el("button", "padding:6px 10px;cursor:pointer;", "Reset all logos");
   const closeBtn = el("button", "padding:6px 10px;cursor:pointer;margin-left:auto;", "Close");
-  footer.append(noneBtn, resetBtn, exportBtn, importBtn, closeBtn);
+  footer.append(noneBtn, resetBtn, resetAllBtn, exportBtn, importBtn, closeBtn);
   box.appendChild(footer);
 
   function send(msg) {
@@ -1007,6 +1010,7 @@ function openPicker(logo) {
   noneBtn.addEventListener("click", () => send({ type: "setOverride", key: club.key, url: null, label: null }));
   resetBtn.addEventListener("click", () => send({ type: "clearOverride", key: club.key }));
   closeBtn.addEventListener("click", closePicker);
+  resetAllBtn.addEventListener("click", () => { if (confirmResetAll()) closePicker(); });
   urlBtn.addEventListener("click", () => {
     const u = urlInput.value.trim();
     if (!/^https:\/\/\S+$/i.test(u)) {
@@ -1028,7 +1032,7 @@ function openPicker(logo) {
 document.addEventListener(
   "click",
   (e) => {
-    if (!e.altKey) return;
+    if (!e.altKey || disabled) return;
     const logo = e.target.closest && e.target.closest(LOGO_SELECTOR);
     if (!logo) return;
     e.preventDefault();
@@ -1084,6 +1088,7 @@ function markCaptain(card, captain) {
 
 // The site redraws the pitch while simulating; put the armband back if it vanished.
 function reapplyCaptains() {
+  if (disabled) return;
   document.querySelectorAll(".card-header.d-flex[data-ms-captain]").forEach((header) => {
     const card = header.closest(".card");
     if (card && !card.querySelector(".ms-captain-badge")) markCaptain(card, header.dataset.msCaptain);
@@ -1162,12 +1167,14 @@ function processEditorSide(side) {
 }
 
 function processEditorPage() {
+  if (disabled) return;
   processEditorSide("home");
   processEditorSide("away");
 }
 
 // The lineup tab has no coach line, so one is added under each team's name.
 function processLineupCards() {
+  if (disabled) return;
   document.querySelectorAll(".card-header.d-flex").forEach((header) => {
     if (header.dataset.msCoachDone) return;
     const span = header.querySelector("span");
@@ -1209,6 +1216,7 @@ function pickPlace(parts, stadium) {
 
 let stadiumHome = "", stadiumText = "";
 function fillStadium() {
+  if (disabled) return;
   const el = document.querySelector(".stadium-name");
   if (!el) return;
   const names = homeAwayNamesFromPage() || matchTeams();
@@ -1239,6 +1247,7 @@ let timer = null;
 new MutationObserver(() => {
   clearTimeout(timer);
   timer = setTimeout(() => {
+    detectPremium();
     scan();
     fillStadium();
     processLineupCards();
@@ -1262,15 +1271,120 @@ new MutationObserver((muts) => {
   }
 }).observe(document.body, { subtree: true, attributes: true, attributeFilter: ["src"] });
 
+// ---------- settings: on/off and premium accounts ----------
+// Accounts with premium get the site's own look: the extension stays off for them.
+// "auto" detects it from the page (a locked "Simulate matchday" button = no premium);
+// the mode can also be forced on or off in the settings panel (Alt+Shift+L).
+let settings = { mode: "auto", premium: null };
+const computeDisabled = () => settings.mode === "off" || (settings.mode === "auto" && settings.premium === true);
+
+function detectPremium() {
+  if (loaded < 3 || settings.mode !== "auto") return; // wait until the saved settings are read
+  let found = null;
+  if (document.querySelector('[data-bs-target="#premiumRequiredModal"]')) {
+    found = false; // a premium-locked control is on screen: no premium
+  } else {
+    const btn = [...document.querySelectorAll("button, a.btn")].find(
+      (b) => /simulate matchday/i.test(b.textContent || "") && !b.querySelector(".fa-crown") && !/locked/i.test(b.id || "")
+    );
+    if (btn) found = true;
+  }
+  if (found === null || found === settings.premium) return;
+  settings.premium = found;
+  const was = disabled;
+  try {
+    chrome.storage.local.set({ msSettings: settings }, () => {
+      if (computeDisabled() !== was) location.reload();
+    });
+  } catch (e) {}
+}
+
+function saveMode(mode) {
+  settings.mode = mode;
+  chrome.storage.local.set({ msSettings: settings }, () => location.reload());
+}
+
+function resetAllLogos(withCorrections) {
+  chrome.runtime.sendMessage({ type: "resetAll", corrections: !!withCorrections }, () => {
+    refreshAll();
+  });
+}
+
+function confirmResetAll() {
+  if (!confirm("Reset ALL logos? They will be searched again from scratch.")) return false;
+  const also = confirm("Also delete your manual corrections (Alt+click choices)?\n\nOK = delete them too\nCancel = keep them");
+  resetAllLogos(also);
+  return true;
+}
+
+function openSettings() {
+  const old = document.getElementById("ms-settings");
+  if (old) { old.remove(); return; }
+  const box = el(
+    "div",
+    "position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:min(380px,92vw);background:#fff;color:#111;" +
+      "border-radius:10px;box-shadow:0 10px 40px rgba(0,0,0,.45);padding:14px;z-index:2147483647;font:14px system-ui,sans-serif;"
+  );
+  box.id = "ms-settings";
+  box.addEventListener("keydown", (e) => { e.stopPropagation(); if (e.key === "Escape") box.remove(); });
+  box.append(el("div", "font-weight:600;margin-bottom:8px;", "Club Logos settings"));
+
+  const status = settings.mode === "auto"
+    ? (settings.premium === true ? "Premium detected: logos are off." : settings.premium === false ? "No premium detected: logos are on." : "Premium not checked yet: logos are on.")
+    : settings.mode === "off" ? "Logos are switched off." : "Logos are switched on.";
+  box.append(el("div", "color:#555;font-size:12px;margin-bottom:6px;", status));
+
+  const sel = el("select", "width:100%;padding:6px;margin-bottom:10px;color:#111;background:#fff;border:1px solid #bbb;border-radius:6px;");
+  [["auto", "Automatic (off while I have premium)"], ["on", "Always show logos"], ["off", "Never show logos"]].forEach(([v, t]) => {
+    const o = el("option", "", t);
+    o.value = v;
+    if (settings.mode === v) o.selected = true;
+    sel.appendChild(o);
+  });
+  sel.addEventListener("change", () => saveMode(sel.value));
+  box.appendChild(sel);
+
+  const btns = el("div", "display:flex;flex-direction:column;gap:6px;");
+  const resetBtn = el("button", "padding:7px 10px;cursor:pointer;", "Reset all logos");
+  resetBtn.addEventListener("click", () => { if (confirmResetAll()) box.remove(); });
+  const exportBtn = el("button", "padding:7px 10px;cursor:pointer;", "Export corrections");
+  exportBtn.addEventListener("click", exportCorrections);
+  const importBtn = el("button", "padding:7px 10px;cursor:pointer;", "Import corrections");
+  importBtn.addEventListener("click", importCorrections);
+  const closeBtn = el("button", "padding:7px 10px;cursor:pointer;", "Close");
+  closeBtn.addEventListener("click", () => box.remove());
+  btns.append(resetBtn, exportBtn, importBtn, closeBtn);
+  box.appendChild(btns);
+  document.body.appendChild(box);
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.altKey && e.shiftKey && (e.key === "L" || e.key === "l")) {
+    e.preventDefault();
+    openSettings();
+  }
+});
+
 let loaded = 0;
 const onLoaded = () => {
-  if (++loaded < 2) return;
+  if (++loaded < 3) return;
+  disabled = computeDisabled();
+  if (disabled) return;
   ready = true;
   scan();
 };
 knownClubs.load(onLoaded);
 flagIds.load(onLoaded);
+try {
+  chrome.storage.local.get("msSettings", (r) => {
+    if (r && r.msSettings) settings = Object.assign(settings, r.msSettings);
+    onLoaded();
+  });
+} catch (e) {
+  onLoaded();
+}
 setTimeout(() => {
+  detectPremium();
   fillStadium();
   processLineupCards();
   processEditorPage();

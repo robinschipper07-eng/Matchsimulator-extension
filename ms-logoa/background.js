@@ -356,7 +356,28 @@ async function fmCandidates(name) {
     if (out.some((c) => c.nameScore >= NAME_OK)) break;
     await sleep(FM_SPACING_MS);
   }
-  return out;
+  // Only keep logos that really exist (clubs without a logo have no image file).
+  const likely = out.filter((c) => c.nameScore >= NAME_MIN_FALLBACK).sort((a, b) => b.nameScore - a.nameScore).slice(0, 4);
+  for (const c of likely) {
+    if (!(await fmLogoExists(c.url))) c.nameScore = -1;
+  }
+  return out.filter((c) => c.nameScore >= 0);
+}
+
+const fmExistsCache = new Map();
+async function fmLogoExists(url) {
+  if (fmExistsCache.has(url)) return fmExistsCache.get(url);
+  let ok = true; // if the check itself fails, assume the logo is fine
+  try {
+    const res = await fetch(url, { method: "HEAD", credentials: "omit" });
+    if (res.status === 404 || res.status === 410) ok = false;
+    else if (res.ok) {
+      const type = res.headers.get("content-type") || "";
+      if (type && !/^image\//i.test(type)) ok = false;
+    }
+  } catch (e) {}
+  fmExistsCache.set(url, ok);
+  return ok;
 }
 
 // ---------- choosing the logo ----------
@@ -676,10 +697,11 @@ async function wikiFlagUrl(name) {
 }
 
 async function manualSearch(q) {
+  const fm = await fmSearch(q);
   const wiki = await wikiSearch(q);
   let teams = await fetchTeams(q);
   if (Array.isArray(teams) && !teams.length && stripAccents(q) !== q) teams = await fetchTeams(stripAccents(q));
-  if (wiki === "RETRY" && teams === "RETRY") {
+  if (wiki === "RETRY" && teams === "RETRY" && !fm.length) {
     return { error: "The logo sources are busy or unreachable. Try again in a moment." };
   }
   const results = [];
@@ -690,6 +712,7 @@ async function manualSearch(q) {
       results.push(r);
     }
   };
+  fm.slice(0, 8).forEach((f) => push({ name: f.label, country: "FMInside", league: "", url: f.url }));
   if (Array.isArray(wiki)) wiki.forEach((w) => push({ name: w.label, country: "Wikipedia", league: "", url: w.url }));
   if (Array.isArray(teams)) {
     teams.forEach((t) =>
@@ -787,6 +810,22 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       return true;
     case "importOverrides":
       importOverrides(msg.data).then(sendResponse);
+      return true;
+    case "resetAll":
+      (async () => {
+        cache = {};
+        claims = {};
+        fmQueryCache.clear();
+        fmExistsCache.clear();
+        clubInfoCache.clear();
+        const keys = [CACHE_KEY, CLAIM_KEY];
+        if (msg.corrections) {
+          overrides = {};
+          keys.push(OVERRIDE_KEY);
+        }
+        await chrome.storage.local.remove(keys);
+        sendResponse(true);
+      })();
       return true;
     case "clearCache":
       cache = {};
