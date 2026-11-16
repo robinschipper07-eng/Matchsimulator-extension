@@ -641,11 +641,9 @@ function describe(info) {
   if (info.source === "override") return "your choice";
   const pct = (v) => Math.round((v || 0) * 100) + "%";
   const parts = [];
-  if (info.via === "colors") parts.push(`closest colours ${pct(info.colorScore)}`);
-  else {
-    parts.push(`name ${pct(info.nameScore != null ? info.nameScore : info.score)}`);
-    if (info.colorScore != null) parts.push(`colours ${pct(info.colorScore)}`);
-  }
+  if (info.confidence != null) parts.push(`accuracy ${pct(info.confidence)}`);
+  parts.push(`name ${pct(info.nameScore != null ? info.nameScore : info.score)}`);
+  if (info.colorScore != null) parts.push(`colours ${pct(info.colorScore)}`);
   if (info.from) parts.push(info.from);
   return parts.join(", ");
 }

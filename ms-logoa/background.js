@@ -15,20 +15,22 @@ const WIKI_API = "https://en.wikipedia.org/w/api.php";
 const SPORTS_SPACING_MS = 2200; // TheSportsDB free tier: about 30 requests/minute
 const WIKI_SPACING_MS = 250;
 
-const CACHE_KEY = "badgeCache6"; // automatic results (bumped: stricter colour fallback)
+const CACHE_KEY = "badgeCache7"; // automatic results (bumped: stricter colour fallback)
 const OVERRIDE_KEY = "badgeOverrides"; // your manual corrections (never expire)
 const CLAIM_KEY = "logoClaims"; // which club owns which logo
 
 // ---- tuning (all values are 0..1) ----
-const NAME_OK = 0.72; // a name at least this similar counts as a name match
-const NAME_EXACT = 0.95; // practically identical name
-// The colour-only fallback (no good name match) is now used rarely and only
-// when both the name and the colours are already a decent fit, so it stops
-// handing out an unrelated club's logo just because the shirt colour matches.
-const NAME_MIN_FALLBACK = 0.62; // minimum name similarity for the colour fallback
-const COLOR_MIN = 0.35; // a name match needs at least this colour similarity
-const COLOR_MIN_EXACT = 0.2; // ...or this much when the name is practically identical
-const COLOR_FALLBACK_MIN = 0.78; // colour-only picks need at least this similarity
+// Every candidate logo gets an accuracy estimate ("confidence") instead of being
+// accepted or rejected on one rule:
+//   name only (colours unknown)      -> name x 0.85
+//   name + colours                   -> name x (0.7 + 0.3 x colours)
+// so a perfect name AND matching colours = 100%, a perfect name with different
+// colours still ~70%, and when the name is not exact the colours decide which
+// candidate is the best bet. The best candidate wins if it reaches ACCEPT.
+const ACCEPT = 0.6; // minimum confidence to use a logo at all
+const CONFIDENT = 0.8; // stop searching more sources once a candidate reaches this
+const NAME_OK = 0.72; // a name at least this similar counts as a name match (labels only)
+const NAME_MIN_FALLBACK = 0.5; // candidates below this name similarity aren't even checked for colour
 const MAX_COLOR_CHECKS = 4; // candidate images analysed per search round
 
 // Site name (lowercase) -> name to search for. Optional.
@@ -416,27 +418,29 @@ async function chooseLogo(name, colors, nk) {
 
   // a logo another club already owns is not available (same family is fine)
   const free = (c) => !taken[c.url] || taken[c.url].nk === nk;
-  const colorOk = (c) =>
-    c.colorScore === null || c.colorScore >= (c.nameScore >= NAME_EXACT ? COLOR_MIN_EXACT : COLOR_MIN);
-  const finish = (c, via) => ({
+  const confidence = (c) => {
+    if (c.colorScore === null || c.colorScore === undefined) return c.nameScore * 0.85;
+    return c.nameScore * (0.7 + 0.3 * c.colorScore);
+  };
+  const finish = (c) => ({
     url: c.url,
     matched: c.label,
-    score: via === "name" ? c.nameScore : c.colorScore,
+    score: confidence(c),
+    confidence: confidence(c),
     nameScore: c.nameScore,
     colorScore: c.colorScore,
-    via,
+    via: c.nameScore >= NAME_OK ? "name" : "colors",
     from: c.source,
   });
   const pick = () => {
-    const byName = cands
-      .filter((c) => free(c) && c.nameScore >= NAME_OK && colorOk(c))
-      .sort((a, b) => b.nameScore - a.nameScore || (b.colorScore || 0) - (a.colorScore || 0));
-    if (byName.length) return finish(byName[0], "name");
-    const byColor = cands
-      .filter((c) => free(c) && c.nameScore >= NAME_MIN_FALLBACK && c.colorScore !== null && c.colorScore >= COLOR_FALLBACK_MIN)
-      .sort((a, b) => b.colorScore - a.colorScore);
-    return byColor.length ? finish(byColor[0], "colors") : null;
+    const ranked = cands
+      .filter((c) => free(c))
+      .map((c) => ({ c, conf: confidence(c) }))
+      .filter((x) => x.conf >= ACCEPT)
+      .sort((a, b) => b.conf - a.conf);
+    return ranked.length ? finish(ranked[0].c) : null;
   };
+  const confident = (r) => r && r.confidence >= CONFIDENT;
 
   const q = ALIASES[name.toLowerCase()] || name;
 
@@ -445,13 +449,13 @@ async function chooseLogo(name, colors, nk) {
   let best = pick();
 
   // Round 1: Wikipedia
-  if (!best) {
+  if (!confident(best)) {
     await add(await wikiSearch(q + " football club"));
     best = pick();
   }
 
-  // Round 2: wider pool, then pick by name + colours (or colours alone)
-  if (!best) {
+  // Round 2: a wider pool (Wikipedia, TheSportsDB); everything found so far competes
+  if (!confident(best)) {
     await sleep(WIKI_SPACING_MS);
     await add(await wikiSearch(q));
     await add(await sportsCandidates(name));
