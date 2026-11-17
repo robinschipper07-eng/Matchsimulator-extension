@@ -15,7 +15,7 @@ const WIKI_API = "https://en.wikipedia.org/w/api.php";
 const SPORTS_SPACING_MS = 2200; // TheSportsDB free tier: about 30 requests/minute
 const WIKI_SPACING_MS = 250;
 
-const CACHE_KEY = "badgeCache7"; // automatic results (bumped: stricter colour fallback)
+const CACHE_KEY = "badgeCache8"; // automatic results (bumped: stricter colour fallback)
 const OVERRIDE_KEY = "badgeOverrides"; // your manual corrections (never expire)
 const CLAIM_KEY = "logoClaims"; // which club owns which logo
 
@@ -302,99 +302,6 @@ async function sportsCandidates(name) {
   return out;
 }
 
-// ---------- FMInside (football manager database) ----------
-// Club logos at img.fminside.net/logos/<version>/Clubs/Normal/<uid>_club.png, found through
-// the club list's name filter. FM uses short names ("Man City", "R. Madrid"), so the
-// name score expands abbreviations instead of comparing plain strings.
-const FM_LIST = "https://fminside.net/clubs";
-const FM_SPACING_MS = 500;
-const fmQueryCache = new Map();
-const CLUB_WORDS = new Set(["fc", "afc", "cf", "sc", "ac", "as", "ss", "rc", "cd", "ud", "sd", "fk", "sk", "bk", "if", "cs", "us", "ud"]);
-
-const unEntity = (s) =>
-  s.replace(/&#0*39;|&apos;/g, "'").replace(/&quot;/g, '"').replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-   .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n));
-
-async function fmSearch(q) {
-  if (fmQueryCache.has(q)) return fmQueryCache.get(q);
-  let out = [];
-  try {
-    const res = await fetch(`${FM_LIST}?page=clubs&gender=1&name=${encodeURIComponent(q)}`, { credentials: "omit" });
-    if (res.ok) {
-      const html = await res.text();
-      const re = /src="((?:https?:)?\/\/img\.fminside\.net\/logos\/[^"?]*\/Clubs\/Normal\/\d+_club\.png)[^"]*"[\s\S]{0,400}?<span class="name"><b><a [^>]*>([^<]+)<\/a>/g;
-      let m;
-      while ((m = re.exec(html))) {
-        const url = m[1].startsWith("//") ? "https:" + m[1] : m[1];
-        out.push({ url, label: unEntity(m[2].trim()), source: "fminside" });
-      }
-    }
-  } catch (e) {}
-  fmQueryCache.set(q, out);
-  return out;
-}
-
-function fmNameScore(wantedNorm, fmName) {
-  const strip = (t) => t.filter((w) => w && !CLUB_WORDS.has(w));
-  const f = strip(norm(fmName).split(" "));
-  const w = strip(wantedNorm.split(" "));
-  if (!f.length || !w.length) return 0;
-  const used = new Set();
-  let matched = 0;
-  for (const ft of f) {
-    const i = w.findIndex((wt, idx) => !used.has(idx) && (wt === ft || wt.startsWith(ft)));
-    if (i >= 0) { used.add(i); matched++; }
-  }
-  const plain = sim(wantedNorm, norm(fmName));
-  // an acronym like "PSG" = Paris Saint Germain
-  if (f.length === 1 && f[0].length >= 2 && f[0] === w.map((t) => t[0]).join("")) return 0.9;
-  if (matched === 0) return plain;
-  const score = (matched / f.length) * (0.5 + 0.5 * (used.size / w.length));
-  // plain string similarity only counts when every FM word was matched ("A. Madrid" is not "Real Madrid")
-  return Math.min(0.99, matched === f.length ? Math.max(plain, score) : score);
-}
-
-async function fmCandidates(name) {
-  const wanted = norm(name);
-  const words = wanted.split(" ").filter((x) => x.length >= 3 && !CLUB_WORDS.has(x)).sort((a, b) => b.length - a.length);
-  const queries = [...new Set([name, ...words.slice(0, 2)])];
-  const out = [];
-  const seen = new Set();
-  for (const q of queries) {
-    const list = await fmSearch(q);
-    for (const c of list) {
-      if (seen.has(c.url)) continue;
-      seen.add(c.url);
-      c.nameScore = fmNameScore(wanted, c.label);
-      out.push(c);
-    }
-    if (out.some((c) => c.nameScore >= NAME_OK)) break;
-    await sleep(FM_SPACING_MS);
-  }
-  // Only keep logos that really exist (clubs without a logo have no image file).
-  const likely = out.filter((c) => c.nameScore >= NAME_MIN_FALLBACK).sort((a, b) => b.nameScore - a.nameScore).slice(0, 4);
-  for (const c of likely) {
-    if (!(await fmLogoExists(c.url))) c.nameScore = -1;
-  }
-  return out.filter((c) => c.nameScore >= 0);
-}
-
-const fmExistsCache = new Map();
-async function fmLogoExists(url) {
-  if (fmExistsCache.has(url)) return fmExistsCache.get(url);
-  let ok = true; // if the check itself fails, assume the logo is fine
-  try {
-    const res = await fetch(url, { method: "HEAD", credentials: "omit" });
-    if (res.status === 404 || res.status === 410) ok = false;
-    else if (res.ok) {
-      const type = res.headers.get("content-type") || "";
-      if (type && !/^image\//i.test(type)) ok = false;
-    }
-  } catch (e) {}
-  fmExistsCache.set(url, ok);
-  return ok;
-}
-
 // ---------- Wikidata (clubs that have no Wikipedia article but do have a logo entry) ----------
 const WD_API = "https://www.wikidata.org/w/api.php";
 async function wikidataCandidates(name) {
@@ -493,17 +400,14 @@ async function chooseLogo(name, colors, nk) {
 
   const q = ALIASES[name.toLowerCase()] || name;
 
-  // Round 0: FMInside (preferred source)
-  await add(await fmCandidates(name));
-  let best = pick();
-
   // Round 1: Wikipedia
-  if (!confident(best)) {
+  let best = null;
+  {
     await add(await wikiSearch(q + " football club"));
     best = pick();
   }
 
-  // Round 2: a wider pool (Wikipedia, TheSportsDB); everything found so far competes
+  // Round 2: a wider pool (Wikipedia, Wikidata, TheSportsDB); everything found so far competes
   if (!confident(best)) {
     await sleep(WIKI_SPACING_MS);
     await add(await wikiSearch(q));
@@ -676,20 +580,56 @@ async function stadiumPlace(stadiumRaw, stadiumName) {
   return [];
 }
 
-async function loadClubInfo(name) {
+// National team page ("Netherlands national football team"), not a youth/women's side.
+async function nationTitleFor(name) {
+  const titles = await wikiPlainSearch(name + " national football team");
+  for (const t of titles) {
+    if (!/national/i.test(t)) continue;
+    if (/\b(under|u-?\d{2}|women|olympic|futsal|beach|amateur|b team|second)\b/i.test(t)) continue;
+    const country = t.replace(/\s+national.*$/i, "").replace(/\s*\([^)]*\)/, "");
+    if (sim(norm(country), norm(name)) >= 0.8) return t;
+  }
+  return null;
+}
+
+async function clubTitleFor(name) {
+  let titles = await wikiPlainSearch(name + " football club");
+  if (!titles.length) titles = await wikiPlainSearch(name);
+  for (const t of titles) {
+    if (sim(norm(t.replace(/\s*\([^)]*\)/, "")), norm(name)) >= 0.6) return t;
+  }
+  return null;
+}
+
+// "<nation> national stadium": a stadium article that says the national team plays there
+async function nationalStadiumFor(name) {
+  const titles = (await wikiPlainSearch(name + " national football stadium")).filter((t) =>
+    /stadium|stadion|stade|estadio|arena|park|ground|field/i.test(t)
+  );
+  for (const t of titles.slice(0, 3)) {
+    const wt = await wikiWikitext(t);
+    if (!wt) continue;
+    const tenants = infoboxRaw(wt, ["tenants", "tenant", "owner", "operator"]) || "";
+    const loc = infoboxRaw(wt, ["location", "city", "address"]) || "";
+    const nameOk = norm(stripWiki(loc) + " " + stripWiki(tenants)).includes(norm(name));
+    const national = /national (football )?team/i.test(tenants) || /national (football )?team/i.test(wt.slice(0, 4000));
+    if (nameOk && national) {
+      return { stadium: t.replace(/\s*\([^)]*\)/, "").trim(), placeParts: placePartsFrom(loc) };
+    }
+  }
+  return null;
+}
+
+async function loadClubInfo(name, nation) {
   const result = { stadium: null, placeParts: [], manager: null, captain: null, title: null };
   try {
-    let titles = await wikiPlainSearch(name + " football club");
-    if (!titles.length) titles = await wikiPlainSearch(name);
-    let title = null;
-    for (const t of titles) {
-      if (sim(norm(t.replace(/\s*\([^)]*\)/, "")), norm(name)) >= 0.6) { title = t; break; }
-    }
+    // nations first look for the national team page; a club (or an unknown modded nation) tries the other kind as a fallback
+    let title = nation ? (await nationTitleFor(name)) || (await clubTitleFor(name)) : (await clubTitleFor(name)) || (await nationTitleFor(name));
     if (!title) return result;
     const wt = await wikiWikitext(title);
     if (!wt) return result;
     result.title = title;
-    const ground = infoboxRaw(wt, ["ground", "stadium"]);
+    const ground = infoboxRaw(wt, ["ground", "stadium", "home stadium", "home_stadium", "home ground", "home_ground"]);
     if (ground) {
       result.stadium = nameFromRaw(ground);
       result.placeParts = await stadiumPlace(ground, result.stadium);
@@ -699,17 +639,22 @@ async function loadClubInfo(name) {
         if (parts.length > 1) result.placeParts = parts.slice(1);
       }
     }
-    const mgr = infoboxRaw(wt, ["manager", "head_coach", "coach"]);
+    if (!result.stadium && nation) {
+      // many national team pages have no home stadium in the infobox: look for the national stadium
+      const st = await nationalStadiumFor(name);
+      if (st) { result.stadium = st.stadium; result.placeParts = st.placeParts; }
+    }
+    const mgr = infoboxRaw(wt, ["manager", "head_coach", "head coach", "coach"]);
     if (mgr) result.manager = nameFromRaw(mgr);
     result.captain = await findCaptain(wt);
   } catch (e) {}
   return result;
 }
 
-function clubInfo(name) {
+function clubInfo(name, nation) {
   name = String(name || "").replace(MOD_TAG, "").trim();
-  const key = norm(name);
-  if (!clubInfoCache.has(key)) clubInfoCache.set(key, loadClubInfo(name));
+  const key = (nation ? "n|" : "c|") + norm(name);
+  if (!clubInfoCache.has(key)) clubInfoCache.set(key, loadClubInfo(name, !!nation));
   return clubInfoCache.get(key);
 }
 
@@ -751,11 +696,10 @@ async function wikiFlagUrl(name) {
 }
 
 async function manualSearch(q) {
-  const fm = await fmSearch(q);
   const wiki = await wikiSearch(q);
   let teams = await fetchTeams(q);
   if (Array.isArray(teams) && !teams.length && stripAccents(q) !== q) teams = await fetchTeams(stripAccents(q));
-  if (wiki === "RETRY" && teams === "RETRY" && !fm.length) {
+  if (wiki === "RETRY" && teams === "RETRY") {
     return { error: "The logo sources are busy or unreachable. Try again in a moment." };
   }
   const results = [];
@@ -766,7 +710,6 @@ async function manualSearch(q) {
       results.push(r);
     }
   };
-  fm.slice(0, 8).forEach((f) => push({ name: f.label, country: "FMInside", league: "", url: f.url }));
   if (Array.isArray(wiki)) wiki.forEach((w) => push({ name: w.label, country: "Wikipedia", league: "", url: w.url }));
   if (Array.isArray(teams)) {
     teams.forEach((t) =>
@@ -848,7 +791,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       wikiFlagUrl(String(msg.name || "").trim()).then((url) => sendResponse({ url }));
       return true;
     case "clubInfo":
-      clubInfo(String(msg.name || "").trim()).then(sendResponse);
+      clubInfo(String(msg.name || "").trim(), !!msg.nation).then(sendResponse);
       return true;
     case "search":
       manualSearch(String(msg.query || "").trim()).then(sendResponse);
@@ -869,8 +812,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       (async () => {
         cache = {};
         claims = {};
-        fmQueryCache.clear();
-        fmExistsCache.clear();
         clubInfoCache.clear();
         const keys = [CACHE_KEY, CLAIM_KEY];
         if (msg.corrections) {

@@ -13,6 +13,9 @@
 
 const LOGO_SELECTOR = ".logo";
 const DEBUG = true;
+// Phones and tablets have no Alt key: there a long press does what Alt+click does.
+const TOUCH = (() => { try { return matchMedia("(pointer: coarse)").matches; } catch (e) { return false; } })();
+const HOW = TOUCH ? "Long-press" : "Alt+click";
 
 // ---- flags ----
 // Flags inside a crest box (4:3): 1 = exactly the box's own standard size.
@@ -661,7 +664,7 @@ function applyLogo(logo, club, info) {
   img.src = info.url;
   img.alt = "";
   img.dataset.msLogo = "1";
-  img.title = `${club.name} \u2192 ${info.matched} (${describe(info)}). Alt+click to correct.`;
+  img.title = `${club.name} \u2192 ${info.matched} (${describe(info)}). ${HOW} to correct.`;
   img.style.cssText =
     "position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;";
   logo.appendChild(img);
@@ -1123,6 +1126,13 @@ document.addEventListener(
   "click",
   (e) => {
     if (!e.altKey || disabled) return;
+    const refEl = e.target.closest && e.target.closest(".ms-referee");
+    if (refEl) {
+      e.preventDefault();
+      e.stopPropagation();
+      editReferee();
+      return;
+    }
     const part = e.target.closest && e.target.closest(".ms-coach, .stadium-name, .ms-captain-badge");
     if (part) {
       const n = clubNameForElement(part);
@@ -1261,9 +1271,9 @@ function processEditorSide(side) {
     const line = document.createElement("div");
     line.className = "ms-coach";
     line.dataset.msClub = name;
-    line.title = "Alt+click to change the manager, stadium or captain";
+    line.title = HOW + " to change the manager, stadium or captain";
     line.style.cssText = "padding:8px 12px 2px;font-size:13px;opacity:" + (store.msManager ? ".8" : ".45") + ";";
-    line.textContent = store.msManager ? "Manager: " + store.msManager : "Manager: unknown (Alt+click to add)";
+    line.textContent = store.msManager ? "Manager: " + store.msManager : "Manager: unknown (" + HOW + " to add)";
     tableHost.insertAdjacentElement("afterend", line);
   }
   markEditorCaptain(side, store.msCaptain);
@@ -1288,9 +1298,9 @@ function processLineupCards() {
       const line = document.createElement("div");
       line.className = "ms-coach";
       line.dataset.msClub = name;
-      line.title = "Alt+click to change the manager, stadium or captain";
+      line.title = HOW + " to change the manager, stadium or captain";
       line.style.cssText = "width:100%;text-align:center;padding:2px 0 4px;font-size:12px;opacity:" + (info.manager ? ".75" : ".45") + ";";
-      line.textContent = info.manager ? "Manager: " + info.manager : "Manager: unknown (Alt+click to add)";
+      line.textContent = info.manager ? "Manager: " + info.manager : "Manager: unknown (" + HOW + " to add)";
       header.insertAdjacentElement("afterend", line);
       if (DEBUG) console.log(`[Club Logos] manager for ${name}: ${info.manager || "none"}`);
       const card = header.closest(".card");
@@ -1336,12 +1346,12 @@ function fillStadium() {
       const place = pickPlace(info.placeParts, info.stadium);
       stadiumText = place ? `${info.stadium}, ${place}` : info.stadium;
     } else {
-      stadiumText = "Stadium unknown (Alt+click to add)";
+      stadiumText = "Stadium unknown (" + HOW + " to add)";
     }
     const cur = document.querySelector(".stadium-name");
     if (cur) {
       cur.textContent = stadiumText;
-      cur.title = "Alt+click to change the stadium, manager or captain";
+      cur.title = HOW + " to change the stadium, manager or captain";
     }
     if (DEBUG) console.log(`[Club Logos] stadium for ${home}: ${stadiumText}`);
   });
@@ -1355,6 +1365,7 @@ new MutationObserver(() => {
     scan();
     fillStadium();
     processLineupCards();
+    fillReferee();
     updateCoachCards();
     processEditorPage();
     reapplyCaptains();
@@ -1406,7 +1417,8 @@ function applyInfoOverrides(info, name) {
 
 // club info from Wikipedia with your entries applied
 function askInfo(name, cb) {
-  chrome.runtime.sendMessage({ type: "clubInfo", name }, (info) => {
+  const nation = !!nationCode(stripTag(name));
+  chrome.runtime.sendMessage({ type: "clubInfo", name, nation }, (info) => {
     const bad = chrome.runtime.lastError || !info;
     cb(applyInfoOverrides(bad ? {} : info, name), bad ? null : info);
   });
@@ -1437,6 +1449,7 @@ function refreshDetails() {
   if (st) { st.textContent = ""; delete st.dataset.msAsking; }
   stadiumHome = ""; stadiumText = "";
   processLineupCards();
+  fillReferee();
   updateCoachCards();
   processEditorPage();
   fillStadium();
@@ -1448,7 +1461,7 @@ function openDetailsDialog(name) {
   const ov = Object.assign({}, ovFor(name));
   const box = el(
     "div",
-    "position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:min(400px,92vw);background:#fff;color:#111;" +
+    "position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:min(400px,92vw);max-height:90vh;overflow:auto;background:#fff;color:#111;" +
       "border-radius:10px;box-shadow:0 10px 40px rgba(0,0,0,.45);padding:14px;z-index:2147483647;font:14px system-ui,sans-serif;"
   );
   box.id = "ms-details";
@@ -1468,7 +1481,7 @@ function openDetailsDialog(name) {
     box.append(input);
   });
   // show what the automatic lookup found as placeholders
-  chrome.runtime.sendMessage({ type: "clubInfo", name }, (info) => {
+  chrome.runtime.sendMessage({ type: "clubInfo", name, nation: !!nationCode(stripTag(name)) }, (info) => {
     if (chrome.runtime.lastError || !info) return;
     const place = pickPlace(info.placeParts, info.stadium);
     if (info.manager) fields.manager.placeholder = info.manager + " (automatic)";
@@ -1504,13 +1517,75 @@ function openDetailsDialog(name) {
   fields.manager.focus();
 }
 
+// ---------- referees ----------
+// The site shows no referee, so one is picked per match from a pool of well-known referees,
+// the same one on every page load. In a national-team match a referee from one of the two
+// countries is skipped. Alt+click the referee line to type another name for this match.
+const REFEREES = [
+  ["Szymon Marciniak", "POL", "pl"], ["Michael Oliver", "ENG", "gb-eng"], ["Anthony Taylor", "ENG", "gb-eng"],
+  ["Cl\u00e9ment Turpin", "FRA", "fr"], ["Fran\u00e7ois Letexier", "FRA", "fr"], ["Slavko Vin\u010di\u0107", "SVN", "si"],
+  ["Danny Makkelie", "NED", "nl"], ["Felix Zwayer", "GER", "de"], ["Daniel Siebert", "GER", "de"],
+  ["Istv\u00e1n Kov\u00e1cs", "ROU", "ro"], ["Artur Soares Dias", "POR", "pt"], ["Jes\u00fas Gil Manzano", "ESP", "es"],
+  ["Carlos del Cerro Grande", "ESP", "es"], ["Glenn Nyberg", "SWE", "se"], ["Davide Massa", "ITA", "it"],
+  ["Marco Guida", "ITA", "it"], ["Facundo Tello", "ARG", "ar"], ["Wilton Sampaio", "BRA", "br"],
+  ["Raphael Claus", "BRA", "br"], ["Ismail Elfath", "USA", "us"], ["Mustapha Ghorbal", "ALG", "dz"],
+  ["Alireza Faghani", "AUS", "au"], ["Ma Ning", "CHN", "cn"], ["Andr\u00e9s Matonte", "URU", "uy"],
+  ["Piero Maza", "CHI", "cl"],
+];
+const REF_OV_KEY = "msRefOverrides";
+
+function refereeFor(hash, teams) {
+  const codes = teams.map((t) => (nationCode(stripTag(t)) || "").toLowerCase()).filter(Boolean);
+  let pool = REFEREES.filter((r) => !codes.includes(r[2]));
+  if (!pool.length) pool = REFEREES;
+  const u = seededRandoms(hash + "|referee", 1)[0];
+  return pool[Math.floor(u * pool.length)];
+}
+
+function refOverrides() {
+  try { return JSON.parse(localStorage.getItem(REF_OV_KEY) || "{}"); } catch (e) { return {}; }
+}
+
+function fillReferee() {
+  if (disabled) return;
+  const slot = document.querySelector(".stadium-name");
+  const hash = pageHash();
+  const teams = homeAwayNamesFromPage() || matchTeams();
+  if (!slot || !hash || !teams) return;
+  let line = document.querySelector(".ms-referee");
+  if (!line) {
+    line = document.createElement("div");
+    line.className = "ms-referee fw-200";
+    line.style.cssText = "font-size:12px;opacity:.75;margin-top:2px;";
+    line.title = HOW + " to change the referee for this match";
+    slot.insertAdjacentElement("afterend", line);
+  }
+  const ov = refOverrides()[hash];
+  const ref = refereeFor(hash, teams);
+  const text = ov ? `Referee: ${ov}` : `Referee: ${ref[0]} (${ref[1]})`;
+  if (line.textContent !== text) line.textContent = text;
+}
+
+function editReferee() {
+  const hash = pageHash();
+  if (!hash) return;
+  const all = refOverrides();
+  const cur = all[hash] || "";
+  const v = prompt('Referee for this match (leave empty for the automatic one):', cur);
+  if (v === null) return;
+  if (v.trim()) all[hash] = v.trim();
+  else delete all[hash];
+  try { localStorage.setItem(REF_OV_KEY, JSON.stringify(all)); } catch (e) {}
+  fillReferee();
+}
+
 // ---------- coach cards ----------
-// The site has no cards for managers, so they are rolled from the match: a team with
-// red/yellow cards of its own players is more likely to see its manager booked.
-// The roll is seeded by the match and side, so it is the same on every page load, and a
-// card never goes away again while the match is still being simulated.
-// Player cards come from the lineup icons: "fa-mobile text-yellow" = yellow, other "fa-mobile" = red.
-const COACH_KEY = "msCoachCards";
+// The site has no cards for managers, so they are rolled from the match: a team whose own
+// players collect cards is more likely to see its manager booked. A card is a real event:
+// it gets a minute, appears in the Summary timeline and in the Commentary, and shows as a
+// small card next to "Manager: ..." on the Lineups tab. The roll is seeded by match + side,
+// so it is the same on every page load, and a card never goes away while the match is live.
+const COACH_KEY = "msCoachCards3";
 
 function seededRandoms(seed, n) {
   let h = 1779033703 ^ seed.length;
@@ -1530,25 +1605,243 @@ function seededRandoms(seed, n) {
   return out;
 }
 
-// 0 = none, 1 = yellow, 2 = red
+// -> { y: minute|0, r: minute|0 }  (0 = no card of that kind)
 function rollCoachCard(hash, side, yellows, reds) {
-  const [u1, u2, u3] = seededRandoms(hash + "|" + side, 3);
-  const pYellow = Math.min(0.7, 0.04 + 0.12 * reds + 0.04 * yellows);
-  const pRed = Math.min(0.45, 0.08 + 0.1 * reds);
-  const pDirectRed = Math.min(0.2, 0.01 * reds);
-  if (u3 < pDirectRed) return 2;
-  if (u1 < pYellow) return u2 < pRed ? 2 : 1;
-  return 0;
+  const [u1, u2, u3, u4, u5] = seededRandoms(hash + "|" + side, 5);
+  const pYellow = Math.min(0.75, 0.07 + 0.14 * reds + 0.05 * yellows);
+  const pRed = Math.min(0.5, 0.1 + 0.1 * reds);
+  const pDirectRed = Math.min(0.2, 0.012 * reds);
+  const yMin = 18 + Math.floor(u4 * 67); // 18..84
+  const out = { y: 0, r: 0 };
+  if (u3 < pDirectRed) {
+    out.r = 25 + Math.floor(u5 * 60);
+  } else if (u1 < pYellow) {
+    out.y = yMin;
+    if (u2 < pRed) out.r = Math.min(90, yMin + 4 + Math.floor(u5 * 18));
+  }
+  return out;
 }
 
+// cards of the team's own players, from the Summary timeline (home events have no side class)
 function countPlayerCards(side) {
-  const prefix = side === "home" ? "playerH" : "playerA";
   let yellows = 0, reds = 0;
-  document.querySelectorAll(`[id^="${prefix}"] i.fa-mobile`).forEach((i) => {
-    if (/text-yellow|bg-yellow/.test(i.className)) yellows++;
-    else reds++;
+  document.querySelectorAll("#timelineContainer .timeline-event").forEach((ev) => {
+    if (ev.dataset.msCoach) return; // our own events
+    const away = ev.classList.contains("side-away");
+    if ((side === "away") !== away) return;
+    if (ev.querySelector("i.yellow-card")) yellows++;
+    else if (ev.querySelector("i.red-card")) reds++;
   });
   return { yellows, reds };
+}
+
+const minuteValue = (txt) => {
+  const m = /(\d+)'/.exec(txt || "");
+  if (!m) return null;
+  const add = /\+\s*(\d+)/.exec(txt);
+  return +m[1] + (add ? +add[1] / 100 : 0);
+};
+
+// minute the match has reached (Infinity once it's finished)
+function currentMinute() {
+  const items = document.querySelectorAll("#feedTab .timeline > .timeline-item");
+  let best = 0;
+  for (const it of items) {
+    const content = cleanName(it.querySelector(".timeline-item-content") ? it.querySelector(".timeline-item-content").textContent : "");
+    if (/match finished|full[- ]time/i.test(content)) return Infinity;
+    const v = minuteValue(it.querySelector(".timeline-item-marker-text") ? it.querySelector(".timeline-item-marker-text").textContent : "");
+    if (v !== null && v > best) best = v;
+  }
+  return best;
+}
+
+const YELLOW_LINES = [
+  (t, m) => `Tempers flare on the touchline and ${t} manager ${m} is shown a yellow card.`,
+  (t, m) => `${m} (${t} manager) is booked for protesting too loudly from the technical area.`,
+  (t, m) => `The referee has had enough of ${m} on the touchline: yellow card for the ${t} manager.`,
+];
+const RED_LINES = [
+  (t, m) => `Red card! ${t} manager ${m} is sent to the stands.`,
+  (t, m) => `${m} sees red on the touchline and the ${t} manager has to leave the technical area!`,
+  (t, m) => `The ${t} manager ${m} is dismissed by the referee after a furious protest.`,
+];
+
+// kinds: coach/bench yellow & red cards, VAR checks
+const KIND = {
+  yellow: { ind: "bg-yellow-soft text-yellow", icon: "fa-mobile bg-yellow", sum: "fa-mobile yellow-card" },
+  red: { ind: "bg-red-soft text-red", icon: "fa-mobile bg-red", sum: "fa-mobile red-card" },
+  var: { ind: "bg-primary-soft text-primary", icon: "fa-video", sum: "fa-video text-primary" },
+};
+
+function addFeedEvent(tag, minute, kind, text) {
+  const list = document.querySelector("#feedTab .timeline");
+  if (!list || list.querySelector(`[data-ms-coach="${tag}"]`)) return;
+  const k = KIND[kind];
+  const item = document.createElement("div");
+  item.className = "timeline-item";
+  item.dataset.msCoach = tag;
+  const marker = document.createElement("div");
+  marker.className = "timeline-item-marker";
+  const mt = document.createElement("div");
+  mt.className = "timeline-item-marker-text";
+  mt.textContent = Math.floor(minute) + "'";
+  const ind = document.createElement("div");
+  ind.className = "timeline-item-marker-indicator " + k.ind;
+  const icon = document.createElement("i");
+  icon.className = "fas " + k.icon;
+  ind.appendChild(icon);
+  marker.append(mt, ind);
+  const content = document.createElement("div");
+  content.className = "timeline-item-content";
+  content.textContent = text;
+  item.append(marker, content);
+  // newest first: go above the first item that is not later than this minute
+  let before = null;
+  for (const it of list.querySelectorAll(":scope > .timeline-item")) {
+    if (/match finished/i.test(it.textContent)) continue;
+    const t = it.querySelector(".timeline-item-marker-text");
+    const v = t ? minuteValue(t.textContent) : null;
+    if (v === null || v <= minute) { before = it; break; }
+  }
+  if (before) list.insertBefore(item, before);
+  else list.appendChild(item);
+}
+
+function addSummaryEvent(tag, minute, kind, side, label) {
+  const box = document.querySelector("#timelineContainer");
+  if (!box || box.querySelector(`[data-ms-coach="${tag}"]`)) return;
+  const ev = document.createElement("div");
+  ev.className = "timeline-event" + (side === "away" ? " side-away" : "");
+  ev.dataset.msCoach = tag;
+  const mn = document.createElement("div");
+  mn.className = "event-minute";
+  mn.textContent = Math.floor(minute) + "'";
+  const ic = document.createElement("div");
+  ic.className = "event-icon";
+  const i = document.createElement("i");
+  i.className = "fas " + KIND[kind].sum;
+  ic.appendChild(i);
+  const pl = document.createElement("div");
+  pl.className = "event-player";
+  pl.textContent = label;
+  ev.append(mn, ic, pl);
+  let before = null;
+  for (const e of box.querySelectorAll(":scope > .timeline-event")) {
+    const v = minuteValue((e.querySelector(".event-minute") || {}).textContent);
+    if (v === null || v <= minute) { before = e; break; }
+  }
+  if (before) box.insertBefore(ev, before);
+  else box.appendChild(ev);
+}
+
+// team + manager of each side, from the Lineups tab
+function sideInfo() {
+  const out = {};
+  document.querySelectorAll(".ms-coach").forEach((line) => {
+    const card = line.previousElementSibling && line.previousElementSibling.closest(".card");
+    if (!card) return;
+    const side = card.querySelector('[id^="playerH"]') ? "home" : card.querySelector('[id^="playerA"]') ? "away" : null;
+    if (!side) return;
+    const m = /^Manager:\s*(.+?)\s*(?:\((?:Alt\+click|Long-press)[^)]*\))?$/.exec(cleanName(line.textContent));
+    out[side] = { team: line.dataset.msClub || "", manager: m && !/^unknown/i.test(m[1]) ? m[1] : "", line };
+  });
+  return out;
+}
+
+const pickFrom = (arr, seed) => arr[Math.floor(seededRandoms(seed, 1)[0] * arr.length)];
+
+// ---------- bench players can be booked / sent off ----------
+const BENCH_YELLOW = [
+  (p, t) => `${p} is booked on the bench for dissent: yellow card for the ${t} substitute.`,
+  (p, t) => `The referee turns to the ${t} bench and shows ${p} a yellow card.`,
+];
+const BENCH_RED = [
+  (p, t) => `Red card for ${p}! The ${t} substitute is sent off from the bench.`,
+  (p, t) => `${p} lost his cool on the ${t} bench and is shown a straight red!`,
+];
+
+// players of a side who have not come on (no "arrow up" icon in the squad tables)
+function unusedBench(side) {
+  const prefix = side === "home" ? "playerH" : "playerA";
+  const out = [];
+  document.querySelectorAll(`.player-td-achievements[id^="${prefix}"]`).forEach((div) => {
+    if (div.querySelector("i.fa-arrow-up")) return;
+    const td = div.closest("td.player-td");
+    const first = td && [...td.childNodes].find((n) => n.nodeType === 3 && cleanName(n.textContent));
+    const name = first && cleanName(first.textContent);
+    if (name) out.push({ name, div });
+  });
+  return out;
+}
+
+function updateBenchCards(hash, now, state) {
+  const info = sideInfo();
+  let changed = false;
+  for (const side of ["home", "away"]) {
+    if (!info[side]) continue;
+    const [u1, u2, u3, u4] = seededRandoms(hash + "|" + side + "|bench", 4);
+    const red = u1 < 0.035;
+    const yellow = !red && u1 < 0.035 + 0.14;
+    if (!red && !yellow) continue;
+    const minute = 22 + Math.floor(u4 * 66);
+    state[side].bench = state[side].bench || null;
+    if (!state[side].bench) {
+      if (now < minute) continue;
+      const pool = unusedBench(side);
+      if (!pool.length) continue;
+      state[side].bench = { name: pool[Math.floor(u3 * pool.length)].name, red, minute };
+      changed = true;
+    }
+    const b = state[side].bench;
+    const kind = b.red ? "red" : "yellow";
+    const text = pickFrom(b.red ? BENCH_RED : BENCH_YELLOW, hash + side + "bt")(b.name, info[side].team || "the");
+    addFeedEvent(side + "-bench", b.minute, kind, text);
+    addSummaryEvent(side + "-bench", b.minute, kind, side, b.name + " (bench)");
+    // the card also shows beside the player in the squad table
+    const row = unusedBench(side).find((p) => p.name === b.name);
+    if (row && !row.div.querySelector("[data-ms-coach]")) {
+      const item = document.createElement("div");
+      item.className = "player-achievement-item";
+      item.dataset.msCoach = side + "-bench";
+      const i = document.createElement("i");
+      i.className = "fas fa-mobile " + (b.red ? "text-danger bg-danger" : "text-yellow bg-yellow");
+      item.appendChild(i);
+      row.div.appendChild(item);
+    }
+  }
+  return changed;
+}
+
+// ---------- VAR ----------
+// VAR checks are only ever confirmations ("goal stands", "red card stands"): the score and the
+// cards of the match never change. Which goals / red cards get checked is seeded per event.
+const VAR_GOAL = [
+  (p) => `VAR is checking the goal by ${p}... after a long look the goal stands!`,
+  (p) => `The referee goes to the monitor for ${p}'s goal. VAR confirms it: goal given.`,
+  (p) => `Check complete: no offside, no foul. ${p}'s goal stands after VAR.`,
+];
+const VAR_RED = [
+  (p) => `VAR reviews the red card for ${p}. The decision stands, he has to go.`,
+  (p) => `The referee checks the monitor for the ${p} incident and confirms the red card.`,
+];
+
+function updateVar(hash) {
+  document.querySelectorAll("#timelineContainer > .timeline-event").forEach((ev) => {
+    if (ev.dataset.msCoach) return;
+    const minute = minuteValue((ev.querySelector(".event-minute") || {}).textContent);
+    if (minute === null) return;
+    const player = cleanName((ev.querySelector(".event-player") || {}).childNodes && ev.querySelector(".event-player").childNodes[0] ? ev.querySelector(".event-player").childNodes[0].textContent : "");
+    const side = ev.classList.contains("side-away") ? "away" : "home";
+    const isGoal = !!ev.querySelector("i.goal") || (!!ev.querySelector("i.fa-futbol") && !ev.querySelector("i.text-danger"));
+    const isRed = !!ev.querySelector("i.red-card");
+    if (!isGoal && !isRed) return;
+    const seed = `${hash}|var|${side}|${Math.floor(minute)}|${player}`;
+    const [u] = seededRandoms(seed, 1);
+    if (u >= (isGoal ? 0.22 : 0.55)) return;
+    const tag = "var-" + side + "-" + Math.floor(minute) + "-" + player.replace(/\W+/g, "");
+    addFeedEvent(tag, minute, "var", pickFrom(isGoal ? VAR_GOAL : VAR_RED, seed + "t")(player));
+    addSummaryEvent(tag, minute, "var", side, isGoal ? "VAR: goal stands" : "VAR: red card stands");
+  });
 }
 
 function updateCoachCards() {
@@ -1557,29 +1850,53 @@ function updateCoachCards() {
   if (!hash) return;
   let all = {};
   try { all = JSON.parse(localStorage.getItem(COACH_KEY) || "{}"); } catch (e) {}
-  const state = all[hash] || { home: 0, away: 0 };
+  const state = all[hash] || { home: { y: 0, r: 0 }, away: { y: 0, r: 0 } };
+  state.home = state.home || { y: 0, r: 0 };
+  state.away = state.away || { y: 0, r: 0 };
   let changed = false;
+  const now = currentMinute();
   document.querySelectorAll(".ms-coach").forEach((line) => {
     const card = line.previousElementSibling && line.previousElementSibling.closest(".card");
     if (!card) return;
     const side = card.querySelector('[id^="playerH"]') ? "home" : card.querySelector('[id^="playerA"]') ? "away" : null;
     if (!side) return;
+    const team = line.dataset.msClub || "";
+    const m = /^Manager:\s*(.+?)\s*(?:\((?:Alt\+click|Long-press)[^)]*\))?$/.exec(cleanName(line.textContent.replace(/\s*$/, "")));
+    let manager = m && !/^unknown/i.test(m[1]) ? m[1] : "";
+    const who = manager || "the manager";
     const { yellows, reds } = countPlayerCards(side);
     const rolled = rollCoachCard(hash, side, yellows, reds);
-    if (rolled > state[side]) { state[side] = rolled; changed = true; }
+    const st = state[side];
+    // a card is kept once it has been shown (same minute), never removed
+    if (rolled.y && !st.y) { st.y = rolled.y; changed = true; }
+    if (rolled.r && !st.r) { st.r = rolled.r; changed = true; }
+    const pickLine = (arr, k) => arr[Math.floor(seededRandoms(hash + side + k, 1)[0] * arr.length)];
+    const shownY = st.y && now >= st.y;
+    const shownR = st.r && now >= st.r;
+    if (shownY) {
+      addFeedEvent(side + "-y", st.y, "yellow", pickLine(YELLOW_LINES, "y")(team, who));
+      addSummaryEvent(side + "-y", st.y, "yellow", side, (manager || team + " manager") + " (manager)");
+    }
+    if (shownR) {
+      addFeedEvent(side + "-r", st.r, "red", pickLine(RED_LINES, "r")(team, who));
+      addSummaryEvent(side + "-r", st.r, "red", side, (manager || team + " manager") + " (manager)");
+    }
+    // card next to the manager line
     let badge = line.querySelector(".ms-coach-card");
-    if (!state[side]) { if (badge) badge.remove(); return; }
+    const level = shownR ? 2 : shownY ? 1 : 0;
+    if (!level) { if (badge) badge.remove(); return; }
     if (!badge) {
       badge = document.createElement("span");
       badge.className = "ms-coach-card";
       line.appendChild(badge);
     }
-    const red = state[side] === 2;
-    badge.title = red ? "Manager sent off (red card)" : "Manager booked (yellow card)";
+    badge.title = level === 2 ? "Manager sent off (red card)" : "Manager booked (yellow card)";
     badge.style.cssText =
       "display:inline-block;width:9px;height:13px;margin-left:6px;border-radius:2px;vertical-align:-2px;" +
-      "background:" + (red ? "#d62828" : "#f4c20d") + ";box-shadow:0 0 0 1px rgba(0,0,0,.25);";
+      "background:" + (level === 2 ? "#d62828" : "#f4c20d") + ";box-shadow:0 0 0 1px rgba(0,0,0,.25);";
   });
+  if (updateBenchCards(hash, now, state)) changed = true;
+  updateVar(hash);
   if (changed) {
     all[hash] = state;
     const keys = Object.keys(all);
@@ -1629,7 +1946,7 @@ function resetAllLogos(withCorrections) {
 
 function confirmResetAll() {
   if (!confirm("Reset ALL logos? They will be searched again from scratch.")) return false;
-  const also = confirm("Also delete your manual corrections (Alt+click choices)?\n\nOK = delete them too\nCancel = keep them");
+  const also = confirm("Also delete your manual corrections (" + HOW + " choices)?\n\nOK = delete them too\nCancel = keep them");
   resetAllLogos(also);
   return true;
 }
@@ -1639,7 +1956,7 @@ function openSettings() {
   if (old) { old.remove(); return; }
   const box = el(
     "div",
-    "position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:min(380px,92vw);background:#fff;color:#111;" +
+    "position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:min(380px,92vw);max-height:90vh;overflow:auto;background:#fff;color:#111;" +
       "border-radius:10px;box-shadow:0 10px 40px rgba(0,0,0,.45);padding:14px;z-index:2147483647;font:14px system-ui,sans-serif;"
   );
   box.id = "ms-settings";
@@ -1681,6 +1998,87 @@ document.addEventListener("keydown", (e) => {
     openSettings();
   }
 });
+
+// ---------- touch devices ----------
+// Long-press (about 0.6 s) on a crest, manager line, stadium, referee or captain armband acts
+// like Alt+click. A small round button (bottom left) opens the settings panel, because there
+// is no Alt+Shift+L on a phone.
+const PRESS_TARGETS = () => LOGO_SELECTOR + ", .ms-coach, .stadium-name, .ms-referee, .ms-captain-badge";
+let pressTimer = null, pressStart = null, suppressClickUntil = 0;
+
+function cancelPress() {
+  clearTimeout(pressTimer);
+  pressTimer = null;
+}
+
+document.addEventListener(
+  "touchstart",
+  (e) => {
+    if (disabled || e.touches.length !== 1) return;
+    const target = e.target.closest && e.target.closest(PRESS_TARGETS());
+    if (!target) return;
+    const t = e.touches[0];
+    pressStart = { x: t.clientX, y: t.clientY };
+    cancelPress();
+    pressTimer = setTimeout(() => {
+      pressTimer = null;
+      suppressClickUntil = Date.now() + 900;
+      if (navigator.vibrate) { try { navigator.vibrate(30); } catch (err) {} }
+      target.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, altKey: true, view: window }));
+    }, 600);
+  },
+  { passive: true, capture: true }
+);
+document.addEventListener(
+  "touchmove",
+  (e) => {
+    if (!pressTimer || !pressStart) return;
+    const t = e.touches[0];
+    if (Math.hypot(t.clientX - pressStart.x, t.clientY - pressStart.y) > 12) cancelPress();
+  },
+  { passive: true, capture: true }
+);
+["touchend", "touchcancel"].forEach((n) => document.addEventListener(n, cancelPress, { passive: true, capture: true }));
+// the browser's own tap/link/menu that follows a long press must not fire
+document.addEventListener(
+  "click",
+  (e) => {
+    if (Date.now() < suppressClickUntil && !e.altKey) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  },
+  true
+);
+document.addEventListener(
+  "contextmenu",
+  (e) => {
+    if (TOUCH && e.target.closest && e.target.closest(PRESS_TARGETS())) e.preventDefault();
+  },
+  true
+);
+
+function addTouchUi() {
+  if (!TOUCH || document.getElementById("ms-gear")) return;
+  const style = document.createElement("style");
+  style.textContent =
+    "#ms-logo-picker button,#ms-details button,#ms-settings button{min-height:40px;padding:8px 12px !important}" +
+    "#ms-logo-picker input,#ms-details input,#ms-settings select{font-size:16px !important;min-height:38px}";
+  document.head.appendChild(style);
+  const gear = el(
+    "button",
+    "position:fixed;left:10px;bottom:14px;width:40px;height:40px;border-radius:50%;border:0;background:#1f2937;color:#fff;" +
+      "font-size:20px;line-height:40px;padding:0;opacity:.75;z-index:2147483000;box-shadow:0 2px 8px rgba(0,0,0,.4);",
+    "\u2699"
+  );
+  gear.id = "ms-gear";
+  gear.title = "Club Logos settings";
+  gear.setAttribute("aria-label", "Club Logos settings");
+  gear.addEventListener("click", (e) => { e.stopPropagation(); openSettings(); });
+  document.body.appendChild(gear);
+}
+if (document.body) addTouchUi();
+else document.addEventListener("DOMContentLoaded", addTouchUi);
 
 let loaded = 0;
 const onLoaded = () => {
