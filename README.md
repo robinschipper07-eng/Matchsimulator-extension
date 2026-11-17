@@ -1,25 +1,22 @@
-# Matchsimulator-extension
+# Match Simulator Club Logos (private)
 
-[WARNING!!!! THIS IS UNFINISHED AND ITS USED WITH AI, MEANS ITS VIBECODED AND CONTAIN BUGS. IT ONLY SERVES FOR A BETTER EXPERIENCE]
+Works on Windows, macOS and Linux, in Google Chrome (and other Chromium browsers such as Edge/Brave) and Firefox.
+Same code for both; only the manifest differs (`manifest.json` = Chrome, `manifest.firefox.json` = Firefox).
 
-An extension for Matchsimulator.
+## Build (optional)
+- Windows: run `build.ps1` (PowerShell). Others: `./build.sh`.
+- Result: `dist/chrome`, `dist/firefox` and a .zip of each.
 
+## Google Chrome / Edge / Brave
+1. Open `chrome://extensions` (Edge: `edge://extensions`), turn on **Developer mode**.
+2. **Load unpacked** and choose this folder (or `dist/chrome`).
+3. After changing files, press the reload icon on the extension, then refresh matchsimulator.com.
 
-
-How to install:
-
-step 1: download the map
-
-step 2: open google
-
-step 3: go to extensions
-
-step 4: look on the right top of your screen and click on developer mode.
-
-step 5: click on 'load unpack extension'
-
-step 6: look on your files and select the map "ms-logoa'
-
-step 7: open/log in on matchsimulator.com
-
-step 8: activate the Match Simulator Club Logos (private) and your done.
+## Firefox (Windows/macOS/Linux)
+1. Open `about:debugging#/runtime/this-firefox`.
+2. **Load Temporary Add-on...** and choose `manifest.json` inside `dist/firefox` (the Firefox build).
+3. Firefox does not grant site access automatically: open `about:addons` > the extension > **Permissions** and turn on
+   "Access your data for sites in the matchsimulator.com domain" plus the wikipedia / thesportsdb / fminside sites.
+4. A temporary add-on is removed when Firefox closes. For a permanent install, sign it (free, "unlisted") at
+   https://addons.mozilla.org/developers/ using `dist/club-logos-firefox.zip`, then install the signed .xpi.
+   (Firefox Developer Edition / Nightly can also load unsigned add-ons permanently with `xpinstall.signatures.required` = false.)
