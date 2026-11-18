@@ -24,7 +24,11 @@ const FLAG_BOX_SCALE = 1;
 // Or set a number to force one fixed pixel width for every crest flag instead
 // (this overrides FLAG_BOX_SCALE).
 const FLAG_BOX_WIDTH_PX = null;
-const flagUrl = (code) => `https://cdn.jsdelivr.net/gh/lipis/flag-icons/flags/4x3/${code}.svg`;
+// Codes starting with "wiki:" name a Commons file (regions with no ISO code)
+const flagUrl = (code) =>
+  code.startsWith("wiki:")
+    ? `https://commons.wikimedia.org/wiki/Special:FilePath/${code.slice(5)}`
+    : `https://cdn.jsdelivr.net/gh/lipis/flag-icons/flags/4x3/${code}.svg`;
 
 const MARK = "msLogoDone";
 // The id after /team/ or /nation/ isn't always a plain number - custom/modded
@@ -321,10 +325,12 @@ zw|Zimbabwe
 je|Jersey
 gg|Guernsey
 im|Isle of Man
-es-ct|Catalonia`;
+es-ct|Catalonia
+wiki:Flag_of_Zanzibar.svg|Zanzibar;Zanzibar Islands
+tt|Trinidad & Tobago;Trinidad Tobago;T&T`;
 
 const natKey = (s) =>
-  nameKey(String(s || "").replace(/\s*[\[(]\s*(?:mod|modded|custom|fictional)\s*[\])]/gi, "")).replace(/[.\u2019'`]/g, "").replace(/[-\u2013]/g, " ").replace(/\s+/g, " ").trim();
+  nameKey(String(s || "").replace(/\s*&\s*/g, " and ").replace(/\s*[\[(]\s*(?:mod|modded|custom|fictional)\s*[\])]/gi, "")).replace(/[.\u2019'`]/g, "").replace(/[-\u2013]/g, " ").replace(/\s+/g, " ").trim();
 
 const NATIONS = new Map();
 for (const line of NATION_DATA.split("\n")) {
@@ -875,14 +881,31 @@ async function processFlagImg(img) {
   // swapping the image, then lock that size in so every flag here stays the
   // same size the site normally uses, whatever that is on this page.
   const rect = img.getBoundingClientRect();
-  const w = img.width || rect.width;
-  const h = img.height || rect.height;
+  let w = rect.width || img.width;
+  let h = rect.height || img.height;
+  // A flag is never legitimately huge. A measurement this big means the image
+  // had no size of its own and was showing at its natural size (e.g. the 512px
+  // flags in the "Automatically qualified" cards), so use a small 4:3 size that
+  // fits the line of text beside it instead of locking the huge one in.
+  const MAX_FLAG = 96;
+  if (w > MAX_FLAG || h > MAX_FLAG || !(w > 0) || !(h > 0)) {
+    const box = img.closest(".logo-container") || img.parentElement;
+    const br = box ? box.getBoundingClientRect() : null;
+    if (br && br.height > 0 && br.height <= MAX_FLAG && br.width <= MAX_FLAG * 2) {
+      h = br.height;
+      w = Math.round(h * 4 / 3);
+    } else {
+      h = 28;
+      w = 37;
+    }
+  }
   img.dataset.msFlag = "1";
   img.src = src;
   img.removeAttribute("srcset");
   img.style.setProperty("object-fit", "fill", "important");
-  if (w > 0) img.style.setProperty("width", w + "px", "important");
-  if (h > 0) img.style.setProperty("height", h + "px", "important");
+  img.style.setProperty("width", w + "px", "important");
+  img.style.setProperty("height", h + "px", "important");
+  img.style.setProperty("max-width", "none", "important");
 }
 
 // ---------- scanning ----------
@@ -1369,6 +1392,9 @@ new MutationObserver(() => {
     updateCoachCards();
     processEditorPage();
     reapplyCaptains();
+    updateSuspensionTable();
+    applyVarToCup();
+    if (pageHash()) expireSuspensions(pageHash());
   }, 300);
 }).observe(document.body, { childList: true, subtree: true });
 
@@ -1774,6 +1800,85 @@ function unusedBench(side) {
   return out;
 }
 
+// ---------- suspensions after bench cards ----------
+// The site's own "Player availability" card lists suspensions, but it knows nothing of the
+// bench cards made here, so they are remembered locally and added to that table.
+const SUSP_KEY = "msSuspensions1";
+const loadSusp = () => { try { return JSON.parse(localStorage.getItem(SUSP_KEY) || "{}") || {}; } catch (e) { return {}; } };
+const saveSusp = (o) => { try { localStorage.setItem(SUSP_KEY, JSON.stringify(o)); } catch (e) {} };
+
+function recordSuspension(hash, side, b) {
+  const all = loadSusp();
+  const id = hash + "|" + side;
+  if (all[id]) return;
+  const fx = fxGet(hash);
+  const info = sideInfo();
+  const cup = (document.querySelector('a[href*="/cup/"]') || { getAttribute: () => "" }).getAttribute("href").match(/\/cup\/(\d+)/);
+  all[id] = {
+    p: b.name,
+    key: fx ? fx[side === "home" ? 0 : 2] : "",
+    team: (info[side] && info[side].team) || (fx ? fx[side === "home" ? 1 : 3] : ""),
+    cup: cup ? cup[1] : "",
+    hash,
+    red: !!b.red,
+  };
+  saveSusp(all);
+}
+
+// served: the team has played its next match
+function expireSuspensions(hash) {
+  if (currentMinute() !== Infinity) return;
+  const fx = fxGet(hash);
+  if (!fx) return;
+  const all = loadSusp();
+  let changed = false;
+  for (const [id, r] of Object.entries(all)) {
+    if (r.hash === hash) continue;
+    if ((r.key && (r.key === fx[0] || r.key === fx[2])) || (!r.key && (sameClubName(r.team, fx[1]) || sameClubName(r.team, fx[3])))) {
+      delete all[id];
+      changed = true;
+    }
+  }
+  if (changed) saveSusp(all);
+}
+
+function updateSuspensionTable() {
+  const tbody = document.querySelector("#availabilityTypeSuspensions tbody");
+  if (!tbody) return;
+  const all = loadSusp();
+  const cupNow = (location.pathname.match(/^\/cup\/(\d+)/) || [])[1] || "";
+  const anchors = [...document.querySelectorAll('a[href*="/team/"]')];
+  tbody.querySelectorAll("tr[data-ms-susp]").forEach((tr) => {
+    if (!all[tr.dataset.msSusp]) tr.remove();
+  });
+  for (const [id, r] of Object.entries(all)) {
+    if (r.cup && cupNow && r.cup !== cupNow) continue;
+    if (tbody.querySelector(`tr[data-ms-susp="${id}"]`)) continue;
+    const a = anchors.find((x) => {
+      const t = teamFromAnchor(x);
+      return t && ((r.key && t.key === r.key) || (!r.key && sameClubName(t.name, r.team)));
+    });
+    if (!a) continue;
+    if ([...tbody.querySelectorAll("tr")].some((tr) => cleanName(tr.cells[0] && tr.cells[0].textContent) === r.p && tr.cells[1] && sameClubName(tr.cells[1].textContent, r.team))) continue;
+    const tr = document.createElement("tr");
+    tr.dataset.msSusp = id;
+    const td1 = document.createElement("td");
+    td1.textContent = r.p;
+    const td2 = document.createElement("td");
+    const link = document.createElement("a");
+    link.href = a.getAttribute("href");
+    link.className = "text-black fw-normal";
+    link.textContent = r.team || cleanName(a.textContent);
+    td2.appendChild(link);
+    const td3 = document.createElement("td");
+    const bold = document.createElement("b");
+    bold.textContent = "Next match";
+    td3.appendChild(bold);
+    tr.append(td1, td2, td3);
+    tbody.appendChild(tr);
+  }
+}
+
 function updateBenchCards(hash, now, state) {
   const info = sideInfo();
   let changed = false;
@@ -1794,6 +1899,9 @@ function updateBenchCards(hash, now, state) {
     }
     const b = state[side].bench;
     const kind = b.red ? "red" : "yellow";
+    // a straight red always means a ban; a yellow only now and then (seeded)
+    const suspended = b.red || seededRandoms(hash + "|" + side + "|benchban", 1)[0] < 0.2;
+    if (suspended) recordSuspension(hash, side, b);
     const text = pickFrom(b.red ? BENCH_RED : BENCH_YELLOW, hash + side + "bt")(b.name, info[side].team || "the");
     addFeedEvent(side + "-bench", b.minute, kind, text);
     addSummaryEvent(side + "-bench", b.minute, kind, side, b.name + " (bench)");
@@ -1805,6 +1913,7 @@ function updateBenchCards(hash, now, state) {
       item.dataset.msCoach = side + "-bench";
       const i = document.createElement("i");
       i.className = "fas fa-mobile " + (b.red ? "text-danger bg-danger" : "text-yellow bg-yellow");
+      if (suspended) item.title = "Suspended for the next match";
       item.appendChild(i);
       row.div.appendChild(item);
     }
@@ -1825,23 +1934,267 @@ const VAR_RED = [
   (p) => `The referee checks the monitor for the ${p} incident and confirms the red card.`,
 ];
 
+// VAR can also overturn: a goal is disallowed (offside / foul / handball) and a card is
+// cancelled. The overturned event stays in the timeline, struck through, and the counters
+// (goals, cards, scoreboard) are lowered to match. Decisions are seeded per event.
+const VAR_OFFSIDE = [
+  (p) => `VAR check on ${p}'s goal... the line is drawn and he was offside! The goal is disallowed.`,
+  (p) => `No goal! After a long VAR review ${p} is judged offside by a toe. The goal is ruled out.`,
+  (p) => `The flag stays down but VAR spots an offside in the build-up. ${p}'s goal does not count.`,
+];
+const VAR_FOUL = [
+  (p) => `VAR spots a foul in the build-up to ${p}'s goal. The referee overturns it: no goal.`,
+  (p) => `The referee watches the monitor and chalks off ${p}'s goal for a push in the box.`,
+];
+const VAR_HAND = [
+  (p) => `Handball in the build-up! VAR sends the referee to the monitor and ${p}'s goal is disallowed.`,
+];
+const VAR_CARD_CANCEL = {
+  red: [
+    (p) => `VAR downgrades it: the red card for ${p} is overturned after the review, he can stay on.`,
+    (p) => `The referee reviews the challenge by ${p} and cancels the red card. Play resumes.`,
+  ],
+  yellow: [
+    (p) => `The referee checks the monitor and withdraws the yellow card shown to ${p}: no booking.`,
+    (p) => `VAR advises a second look and ${p}'s yellow card is rescinded.`,
+  ],
+};
+
+const VAR_SCORE_SEL = {
+  home: "#homeGoals,#homeGoalsSm",
+  away: "#awayGoals,#awayGoalsSm",
+};
+
+// lower a number the site writes itself; if the site rewrites it, rebase on its new value
+function applyDelta(el, delta) {
+  if (!el || !/^\s*\d+\s*$/.test(el.textContent)) return;
+  const cur = +el.textContent;
+  if (el.dataset.msShown !== undefined && String(cur) === el.dataset.msShown && el.dataset.msDelta === String(delta)) return;
+  let base = cur;
+  if (el.dataset.msShown !== undefined && String(cur) === el.dataset.msShown) base = +el.dataset.msBase;
+  const shown = Math.max(0, base - delta);
+  el.dataset.msBase = String(base);
+  el.dataset.msDelta = String(delta);
+  el.dataset.msShown = String(shown);
+  el.textContent = String(shown);
+}
+
+function isPenaltyGoal(player, minute) {
+  const shootout = (() => {
+    const ps = document.getElementById("penaltyScore");
+    if (ps && !ps.classList.contains("hidden")) return true;
+    return !!document.querySelector('[id^="penaltyHome_"]:not(.text-gray-400),[id^="penaltyAway_"]:not(.text-gray-400)');
+  })();
+  if (shootout && minute >= 120) return true;
+  const sur = player.split(" ").pop().toLowerCase();
+  const mn = Math.floor(minute);
+  for (const it of document.querySelectorAll("#feedTab .timeline > .timeline-item:not([data-ms-coach])")) {
+    const t = minuteValue((it.querySelector(".timeline-item-marker-text") || {}).textContent);
+    if (t === null || Math.floor(t) !== mn) continue;
+    const c = (it.querySelector(".timeline-item-content") || it).textContent.toLowerCase();
+    if (/penalt|spot[- ]kick|from the spot/.test(c) && (sur.length < 3 || c.includes(sur))) return true;
+  }
+  return false;
+}
+
 function updateVar(hash) {
+  const delta = { home: { goal: 0, yellow: 0, red: 0 }, away: { goal: 0, yellow: 0, red: 0 } };
+  const cancelled = [];
   document.querySelectorAll("#timelineContainer > .timeline-event").forEach((ev) => {
     if (ev.dataset.msCoach) return;
     const minute = minuteValue((ev.querySelector(".event-minute") || {}).textContent);
     if (minute === null) return;
     const player = cleanName((ev.querySelector(".event-player") || {}).childNodes && ev.querySelector(".event-player").childNodes[0] ? ev.querySelector(".event-player").childNodes[0].textContent : "");
     const side = ev.classList.contains("side-away") ? "away" : "home";
-    const isGoal = !!ev.querySelector("i.goal") || (!!ev.querySelector("i.fa-futbol") && !ev.querySelector("i.text-danger"));
     const isRed = !!ev.querySelector("i.red-card");
-    if (!isGoal && !isRed) return;
+    const isYellow = !isRed && !!ev.querySelector("i.yellow-card");
+    const isGoal = !isRed && !isYellow && (!!ev.querySelector("i.goal") || (!!ev.querySelector("i.fa-futbol") && !ev.querySelector("i.text-danger")));
+    if (!isGoal && !isRed && !isYellow) return;
     const seed = `${hash}|var|${side}|${Math.floor(minute)}|${player}`;
-    const [u] = seededRandoms(seed, 1);
-    if (u >= (isGoal ? 0.22 : 0.55)) return;
+    const [u0, v] = seededRandoms(seed, 2);
+    // goals from the spot are never overturned by VAR (penalties in play and in a shoot-out)
+    const u = isGoal && isPenaltyGoal(player, minute) ? 1 : u0;
     const tag = "var-" + side + "-" + Math.floor(minute) + "-" + player.replace(/\W+/g, "");
-    addFeedEvent(tag, minute, "var", pickFrom(isGoal ? VAR_GOAL : VAR_RED, seed + "t")(player));
-    addSummaryEvent(tag, minute, "var", side, isGoal ? "VAR: goal stands" : "VAR: red card stands");
+    const mn = Math.floor(minute);
+    let overturned = null; // text of the VAR decision
+    let label = "";
+    let confirmed = null;
+    if (isGoal) {
+      if (u < 0.13) {
+        const pool = v < 0.6 ? VAR_OFFSIDE : v < 0.85 ? VAR_FOUL : VAR_HAND;
+        overturned = pickFrom(pool, seed + "t")(player);
+        label = pool === VAR_OFFSIDE ? "VAR: goal disallowed (offside)" : pool === VAR_FOUL ? "VAR: goal disallowed (foul)" : "VAR: goal disallowed (handball)";
+      } else if (u < 0.3) confirmed = pickFrom(VAR_GOAL, seed + "t")(player);
+    } else if (isRed) {
+      if (u < 0.2) {
+        overturned = pickFrom(VAR_CARD_CANCEL.red, seed + "t")(player);
+        label = "VAR: red card overturned";
+      } else if (u < 0.6) confirmed = pickFrom(VAR_RED, seed + "t")(player);
+    } else if (u < 0.07) {
+      overturned = pickFrom(VAR_CARD_CANCEL.yellow, seed + "t")(player);
+      label = "VAR: yellow card cancelled";
+    }
+    if (overturned) {
+      ev.classList.add("ms-var-off");
+      delta[side][isGoal ? "goal" : isRed ? "red" : "yellow"]++;
+      cancelled.push({ kind: isGoal ? "goal" : isRed ? "red" : "yellow", side, player });
+      addFeedEvent(tag, minute, "var", overturned);
+      addSummaryEvent(tag, minute, "var", side, label);
+      // strike the original commentary line of the same minute that names the player
+      const surname = player.split(" ").pop().toLowerCase();
+      document.querySelectorAll("#feedTab .timeline > .timeline-item:not([data-ms-coach])").forEach((it) => {
+        const t = minuteValue((it.querySelector(".timeline-item-marker-text") || {}).textContent);
+        if (t === null || Math.floor(t) !== mn) return;
+        const c = (it.querySelector(".timeline-item-content") || it).textContent.toLowerCase();
+        const goalish = /goal|scor|net|finish/.test(c), cardish = /card|booked|sent off|red|yellow/.test(c);
+        if (surname.length > 2 && c.includes(surname) && (isGoal ? goalish : cardish)) it.classList.add("ms-var-off");
+      });
+    } else if (confirmed) {
+      addFeedEvent(tag, minute, "var", confirmed);
+      addSummaryEvent(tag, minute, "var", side, isGoal ? "VAR: goal stands" : "VAR: red card stands");
+    }
   });
+  if (!document.getElementById("ms-var-style")) {
+    const st = document.createElement("style");
+    st.id = "ms-var-style";
+    st.textContent = ".ms-var-off .event-player,.ms-var-off .timeline-item-content{text-decoration:line-through;opacity:.55}.ms-var-off .event-icon,.ms-var-off .timeline-item-marker-indicator{opacity:.45}";
+    document.head.appendChild(st);
+  }
+  for (const side of ["home", "away"]) {
+    applyDelta(document.getElementById(side + "GoalsCount"), delta[side].goal);
+    applyDelta(document.getElementById(side + "YellowCardsCount"), delta[side].yellow);
+    applyDelta(document.getElementById(side + "RedCardsCount"), delta[side].red);
+    // the scoreboard, where the page has one with a plain number in it
+    document.querySelectorAll(VAR_SCORE_SEL[side]).forEach((el) => { if (!el.children.length) applyDelta(el, delta[side].goal); });
+  }
+  hideCancelledIcons(cancelled);
+  recordVarGoals(hash, cancelled);
+}
+
+// The cancelled card / goal icon also disappears from the lineups (pitch and squad tables).
+// Players are found by the name in the squad tables; their achievement boxes share one id.
+const ICON_SEL = {
+  yellow: "i.fa-mobile.text-yellow",
+  red: "i.fa-mobile.text-danger",
+  goal: "i.fa-futbol.text-primary, i.fa-futbol.text-success",
+};
+function hideCancelledIcons(list) {
+  const want = new Map(); // container id -> {kind: count}
+  for (const c of list) {
+    const prefix = c.side === "home" ? "playerH" : "playerA";
+    let id = null;
+    document.querySelectorAll(`td.player-td`).forEach((td) => {
+      const first = td.childNodes[0];
+      const box = td.querySelector(`.player-td-achievements[id^="${prefix}"]`);
+      if (box && first && cleanName(first.textContent) === c.player) id = box.id;
+    });
+    if (!id) {
+      // starters are only on the pitch, which shows the surname
+      const sur = cleanName(c.player.replace(/^(?:[A-Z]\.\s*)+/, ""));
+      const hits = [];
+      document.querySelectorAll(".pitch .player-wrapper").forEach((w) => {
+        const box = w.querySelector(`.player-achievement[id^="${prefix}"]`);
+        const nm = w.querySelector(".player-name");
+        if (box && nm && cleanName(nm.textContent) === sur) hits.push(box.id);
+      });
+      if (hits.length === 1) id = hits[0];
+    }
+    if (!id) continue;
+    const w = want.get(id) || {};
+    w[c.kind] = (w[c.kind] || 0) + 1;
+    want.set(id, w);
+  }
+  for (const [id, w] of want) {
+    document.querySelectorAll(`[id="${id}"]`).forEach((box) => {
+      for (const [kind, n] of Object.entries(w)) {
+        const items = [...box.querySelectorAll(".player-achievement-item")].filter(
+          (it) => !it.dataset.msCoach && it.querySelector(ICON_SEL[kind]) && !(kind === "goal" && it.querySelector("i.text-danger"))
+        );
+        let hidden = items.filter((it) => it.dataset.msVarHidden).length;
+        for (const it of items) {
+          if (hidden >= n) break;
+          if (it.dataset.msVarHidden) continue;
+          it.dataset.msVarHidden = kind;
+          it.style.setProperty("display", "none", "important");
+          hidden++;
+        }
+      }
+    });
+  }
+}
+
+// ---- disallowed goals, remembered for the cup pages ----
+const VARGOAL_KEY = "msVarGoals1";
+const loadVarGoals = () => { try { return JSON.parse(localStorage.getItem(VARGOAL_KEY) || "{}") || {}; } catch (e) { return {}; } };
+function recordVarGoals(hash, list) {
+  if (!list.length) return;
+  const all = loadVarGoals();
+  const info = sideInfo();
+  const fx = fxGet(hash);
+  const teamOf = (side) => (info[side] && info[side].team) || (fx ? fx[side === "home" ? 1 : 3] : "");
+  const rec = { home: 0, away: 0, scorers: [], yellows: [], reds: [] };
+  for (const c of list) {
+    const row = { p: c.player, team: teamOf(c.side) };
+    if (c.kind === "goal") { rec[c.side]++; rec.scorers.push(row); }
+    else if (c.kind === "yellow") rec.yellows.push(row);
+    else rec.reds.push(row);
+  }
+  const old = all[hash];
+  // a decision that was made stays made
+  const n = (r) => r ? r.scorers.length + (r.yellows || []).length + (r.reds || []).length : 0;
+  if (old && n(old) > n(rec)) return;
+  all[hash] = rec;
+  try { localStorage.setItem(VARGOAL_KEY, JSON.stringify(all)); } catch (e) {}
+}
+
+// cup page: lower the fixture results and the top-scorer table by the disallowed goals
+function applyVarToCup() {
+  const all = loadVarGoals();
+  if (!Object.keys(all).length) return;
+  document.querySelectorAll('a[href*="/match/"]').forEach((a) => {
+    const m = /\/match\/([0-9a-f]{8,})\//.exec(a.getAttribute("href") || "");
+    const rec = m && all[m[1]];
+    if (!rec) return;
+    const cur = a.textContent.trim();
+    if (a.dataset.msShown === cur) return;
+    const mm = /^(\d+)\s*-\s*(\d+)$/.exec(cur);
+    if (!mm) return;
+    const shown = Math.max(0, +mm[1] - rec.home) + "-" + Math.max(0, +mm[2] - rec.away);
+    a.dataset.msOrig = cur;
+    a.dataset.msShown = shown;
+    a.textContent = shown;
+  });
+  for (const [boxId, field] of [["playerStatsGoals", "scorers"], ["playerStatsYellowCards", "yellows"], ["playerStatsRedCards", "reds"]]) {
+    const table = document.querySelector("#" + boxId + " table");
+    if (!table) continue;
+    const cut = [];
+    for (const rec of Object.values(all)) for (const sc of rec[field] || []) cut.push(sc);
+    if (!cut.length) continue;
+    let rank = 0;
+    table.querySelectorAll("tr").forEach((tr) => {
+      const b = tr.querySelector("td:last-child b");
+      if (!b || tr.cells.length < 3 || !/^\d+$/.test(b.textContent.trim())) return;
+      if (b.dataset.msShown !== b.textContent.trim()) {
+        const name = cleanName(tr.cells[1].textContent);
+        // a team page has no team column: the name alone has to do
+        const team = tr.cells.length >= 4 ? cleanName(tr.cells[2].textContent) : "";
+        const n = cut.filter((sc) => sc.p === name && (!team || sameClubName(sc.team, team))).length;
+        if (n) {
+          const shown = String(Math.max(0, +b.textContent - n));
+          b.dataset.msShown = shown;
+          b.textContent = shown;
+        }
+      }
+      // nobody is listed with 0, and the ranks follow on
+      if (b.textContent.trim() === "0") { tr.style.setProperty("display", "none", "important"); return; }
+      tr.style.removeProperty("display");
+      const rk = tr.cells[0];
+      if (rk && /^\d+$/.test(rk.textContent.trim())) {
+        rank++;
+        if (rk.textContent.trim() !== String(rank)) rk.textContent = String(rank);
+      }
+    });
+  }
 }
 
 function updateCoachCards() {
