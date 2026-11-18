@@ -1394,6 +1394,8 @@ new MutationObserver(() => {
     reapplyCaptains();
     updateSuspensionTable();
     applyVarToCup();
+    applyVarToStatsPage();
+    applyVarToStandings();
     if (pageHash()) expireSuspensions(pageHash());
   }, 300);
 }).observe(document.body, { childList: true, subtree: true });
@@ -2037,7 +2039,8 @@ function updateVar(hash) {
     if (overturned) {
       ev.classList.add("ms-var-off");
       delta[side][isGoal ? "goal" : isRed ? "red" : "yellow"]++;
-      cancelled.push({ kind: isGoal ? "goal" : isRed ? "red" : "yellow", side, player });
+      const asEl = ev.querySelector(".event-player span");
+      cancelled.push({ kind: isGoal ? "goal" : isRed ? "red" : "yellow", side, player, assist: asEl ? cleanName(asEl.textContent) : "" });
       addFeedEvent(tag, minute, "var", overturned);
       addSummaryEvent(tag, minute, "var", side, label);
       // strike the original commentary line of the same minute that names the player
@@ -2132,17 +2135,34 @@ function recordVarGoals(hash, list) {
   const info = sideInfo();
   const fx = fxGet(hash);
   const teamOf = (side) => (info[side] && info[side].team) || (fx ? fx[side === "home" ? 1 : 3] : "");
-  const rec = { home: 0, away: 0, scorers: [], yellows: [], reds: [] };
+  const rec = { home: 0, away: 0, scorers: [], yellows: [], reds: [], assists: [], ht: teamOf("home"), at: teamOf("away") };
+  // the score the site itself gave the finished match, before the extension lowered it
+  const orig = (id) => { const el = document.getElementById(id); return el && el.dataset.msBase !== undefined ? +el.dataset.msBase : null; };
+  if (currentMinute() === Infinity) {
+    const ho = orig("homeGoals"), ao = orig("awayGoals");
+    if (ho !== null && ao !== null) { rec.ho = ho; rec.ao = ao; }
+  }
   for (const c of list) {
     const row = { p: c.player, team: teamOf(c.side) };
-    if (c.kind === "goal") { rec[c.side]++; rec.scorers.push(row); }
+    if (c.kind === "goal") {
+      rec[c.side]++;
+      rec.scorers.push(row);
+      if (c.assist) rec.assists.push({ p: c.assist, team: row.team });
+    }
     else if (c.kind === "yellow") rec.yellows.push(row);
     else rec.reds.push(row);
   }
   const old = all[hash];
   // a decision that was made stays made
-  const n = (r) => r ? r.scorers.length + (r.yellows || []).length + (r.reds || []).length : 0;
-  if (old && n(old) > n(rec)) return;
+  const n = (r) => r ? r.scorers.length + (r.yellows || []).length + (r.reds || []).length + (r.assists || []).length : 0;
+  if (old && n(old) > n(rec)) {
+    if (old.ho === undefined && rec.ho !== undefined) {
+      old.ho = rec.ho; old.ao = rec.ao;
+      try { localStorage.setItem(VARGOAL_KEY, JSON.stringify(all)); } catch (e) {}
+    }
+    return;
+  }
+  if (old && old.ho !== undefined && rec.ho === undefined) { rec.ho = old.ho; rec.ao = old.ao; }
   all[hash] = rec;
   try { localStorage.setItem(VARGOAL_KEY, JSON.stringify(all)); } catch (e) {}
 }
@@ -2164,7 +2184,7 @@ function applyVarToCup() {
     a.dataset.msShown = shown;
     a.textContent = shown;
   });
-  for (const [boxId, field] of [["playerStatsGoals", "scorers"], ["playerStatsYellowCards", "yellows"], ["playerStatsRedCards", "reds"]]) {
+  for (const [boxId, field] of [["playerStatsGoals", "scorers"], ["playerStatsYellowCards", "yellows"], ["playerStatsRedCards", "reds"], ["playerStatsAssists", "assists"]]) {
     const table = document.querySelector("#" + boxId + " table");
     if (!table) continue;
     const cut = [];
@@ -2195,6 +2215,111 @@ function applyVarToCup() {
       }
     });
   }
+}
+
+// the full "Player stats" page: one row per player with G / A / YC / RC columns
+function applyVarToStatsPage() {
+  const all = loadVarGoals();
+  if (!Object.keys(all).length) return;
+  document.querySelectorAll("table").forEach((table) => {
+    const heads = [...table.querySelectorAll("thead th")].map((th) => cleanName(th.textContent));
+    if (heads[0] !== "Player" || heads[1] !== "Team") return;
+    const cols = { scorers: heads.indexOf("G"), assists: heads.indexOf("A"), yellows: heads.indexOf("YC"), reds: heads.indexOf("RC") };
+    table.querySelectorAll("tbody tr").forEach((tr) => {
+      if (tr.cells.length < heads.length) return;
+      const name = cleanName(tr.cells[0].textContent), team = cleanName(tr.cells[1].textContent);
+      for (const [field, ci] of Object.entries(cols)) {
+        if (ci < 0) continue;
+        const cell = tr.cells[ci];
+        const txt = cell.textContent.trim();
+        if (!/^\d+$/.test(txt) || cell.dataset.msShown === txt) continue;
+        let n = 0;
+        for (const rec of Object.values(all)) for (const sc of rec[field] || []) if (sc.p === name && sameClubName(sc.team, team)) n++;
+        if (!n) continue;
+        const shown = String(Math.max(0, +txt - n));
+        cell.dataset.msShown = shown;
+        cell.textContent = shown;
+      }
+    });
+  });
+}
+
+// league table: goals for/against, results and points follow the disallowed goals
+function applyVarToStandings() {
+  const table = document.getElementById("leagueTable");
+  if (!table) return;
+  const recs = Object.values(loadVarGoals()).filter((r) => r.ho !== undefined && r.ht && r.at);
+  if (!recs.length) return;
+  const heads = [...table.querySelectorAll("thead th")].map((th) => cleanName(th.textContent));
+  const col = (n) => heads.indexOf(n);
+  const C = { W: col("W"), D: col("D"), L: col("L"), GF: col("GF"), GA: col("GA"), GD: col("GD"), PTS: col("PTS") };
+  if (C.GF < 0 || C.PTS < 0 || col("Team") < 0) return;
+  const res = (f, a) => (f > a ? "W" : f < a ? "L" : "D");
+  const pts = { W: 3, D: 1, L: 0 };
+  const rows = [...table.querySelectorAll("tbody tr")];
+  let changed = false;
+  const bump = (cell, d) => {
+    if (!cell || !d) return false;
+    const el = cell.querySelector("b") || cell;
+    const txt = el.textContent.trim();
+    if (!/^-?\d+$/.test(txt) || el.dataset.msShown === txt) return false;
+    const shown = String(+txt + d);
+    el.dataset.msShown = shown;
+    el.textContent = shown;
+    return true;
+  };
+  for (const tr of rows) {
+    if (tr.cells.length < heads.length) continue;
+    const team = cleanName(tr.cells[col("Team")].textContent);
+    const d = { W: 0, D: 0, L: 0, GF: 0, GA: 0, GD: 0, PTS: 0 };
+    let hit = false;
+    for (const r of recs) {
+      for (const side of ["home", "away"]) {
+        if (!sameClubName(side === "home" ? r.ht : r.at, team)) continue;
+        const other = side === "home" ? "away" : "home";
+        const f0 = side === "home" ? r.ho : r.ao, a0 = side === "home" ? r.ao : r.ho;
+        const f1 = Math.max(0, f0 - r[side]), a1 = Math.max(0, a0 - r[other]);
+        const r0 = res(f0, a0), r1 = res(f1, a1);
+        hit = true;
+        d.GF += f1 - f0; d.GA += a1 - a0; d.GD += f1 - f0 - (a1 - a0);
+        if (r0 !== r1) { d[r0]--; d[r1]++; d.PTS += pts[r1] - pts[r0]; }
+      }
+    }
+    if (!hit) continue;
+    for (const k of Object.keys(d)) if (C[k] >= 0 && bump(tr.cells[C[k]], d[k])) changed = true;
+  }
+  // the form dots: "Home 0-3 Away" with the result letter from this row's team
+  rows.forEach((tr) => {
+    const team = cleanName((tr.cells[col("Team")] || { textContent: "" }).textContent);
+    tr.querySelectorAll(".form-div").forEach((dot) => {
+      const t = dot.getAttribute("data-bs-original-title") || dot.getAttribute("title") || "";
+      const m = /^(.*?) (\d+)-(\d+) (.*)$/.exec(t);
+      if (!m) return;
+      const r = recs.find((x) => sameClubName(x.ht, m[1]) && sameClubName(x.at, m[4]) && x.ho === +m[2] && x.ao === +m[3]);
+      if (!r) return;
+      const h = Math.max(0, r.ho - r.home), a = Math.max(0, r.ao - r.away);
+      const mine = sameClubName(m[1], team) ? res(h, a) : res(a, h);
+      const nt = `${m[1]} ${h}-${a} ${m[4]}`;
+      if (dot.hasAttribute("data-bs-original-title")) dot.setAttribute("data-bs-original-title", nt);
+      if (dot.hasAttribute("title")) dot.setAttribute("title", nt);
+      dot.classList.remove("W", "D", "L");
+      dot.classList.add(mine);
+      if (dot.textContent.trim() !== mine) dot.textContent = mine;
+    });
+  });
+  if (!changed) return;
+  // re-rank: points, goal difference, goals for; the position cells (with their colours) stay put
+  const num = (tr, k) => (C[k] >= 0 ? +((tr.cells[C[k]].querySelector("b") || tr.cells[C[k]]).textContent.trim()) || 0 : 0);
+  const rankCells = rows.map((tr) => tr.cells[0]);
+  const order = rows
+    .map((tr, i) => ({ tr, i }))
+    .sort((x, y) => num(y.tr, "PTS") - num(x.tr, "PTS") || num(y.tr, "GD") - num(x.tr, "GD") || num(y.tr, "GF") - num(x.tr, "GF") || x.i - y.i)
+    .map((o) => o.tr);
+  const tbody = rows[0].parentNode;
+  order.forEach((tr) => tbody.appendChild(tr));
+  order.forEach((tr, i) => {
+    if (tr.cells[0] !== rankCells[i]) tr.insertBefore(rankCells[i], tr.firstChild);
+  });
 }
 
 function updateCoachCards() {
