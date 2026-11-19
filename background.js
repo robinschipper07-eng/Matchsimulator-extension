@@ -831,3 +831,19 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       return true;
   }
 });
+
+
+// When the extension is updated, the pages already open still run the old version of the
+// content script. Reloading them picks the new one up (and the content script then refreshes
+// its own saved VAR data for the new version).
+chrome.runtime.onInstalled.addListener((details) => {
+  if (details.reason !== "update") return;
+  try {
+    chrome.tabs.query({ url: "https://matchsimulator.com/*" }, (tabs) => {
+      void chrome.runtime.lastError;
+      for (const t of tabs || []) {
+        try { chrome.tabs.reload(t.id); } catch (e) {}
+      }
+    });
+  } catch (e) {}
+});

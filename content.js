@@ -1380,6 +1380,17 @@ function fillStadium() {
   });
 }
 
+// A new version of the extension starts from clean VAR data, so decisions made by an older
+// version are made again with the current rules (nothing the user typed is touched).
+try {
+  const ver = chrome.runtime.getManifest().version;
+  if (localStorage.getItem("msExtVersion") !== ver) {
+    localStorage.removeItem("msVarGoals2");
+    localStorage.removeItem("msVarSeen2");
+    localStorage.setItem("msExtVersion", ver);
+  }
+} catch (e) {}
+
 let timer = null;
 new MutationObserver(() => {
   clearTimeout(timer);
@@ -1393,12 +1404,21 @@ new MutationObserver(() => {
     processEditorPage();
     reapplyCaptains();
     updateSuspensionTable();
+    autoVarScan();
     applyVarToCup();
     applyVarToStatsPage();
     applyVarToStandings();
+    fixResultLetters();
     if (pageHash()) expireSuspensions(pageHash());
   }, 300);
-}).observe(document.body, { childList: true, subtree: true });
+}).observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["href"] });
+
+// While a cup is being simulated the site updates scores in place, and not every kind of
+// in-place change is seen above, so the VAR changes are also re-checked now and then.
+setInterval(() => {
+  if (disabled || document.hidden) return;
+  try { autoVarScan(); varApplyAll(); fixResultLetters(); } catch (e) {}
+}, 1500);
 
 // While a cup is being simulated, the site reuses existing flag <img>
 // elements and just changes their "src" as fixtures update live, instead of
@@ -1999,11 +2019,32 @@ function isPenaltyGoal(player, minute) {
   return false;
 }
 
+// One roll per event, seeded by who/what/which-time-for-that-player (not by the minute text,
+// which differs between the page and the data the server sends), so reading the data of a
+// match gives the same decisions as watching it.
+function varRoll(hash, side, kind, player, idx, isPen) {
+  const seed = `${hash}|var2|${side}|${kind}|${player}|${idx}`;
+  const [u0, v] = seededRandoms(seed, 2);
+  return { seed, u: kind === "goal" && isPen ? 1 : u0, v };
+}
+const varOverturned = (kind, u) => (kind === "goal" ? u < 0.13 : kind === "red" ? u < 0.2 : u < 0.07);
+
 function updateVar(hash) {
   const delta = { home: { goal: 0, yellow: 0, red: 0 }, away: { goal: 0, yellow: 0, red: 0 } };
   const cancelled = [];
-  document.querySelectorAll("#timelineContainer > .timeline-event").forEach((ev) => {
-    if (ev.dataset.msCoach) return;
+  const evNodes = [...document.querySelectorAll("#timelineContainer > .timeline-event")].filter((e) => !e.dataset.msCoach);
+  const seenCount = new Map();
+  const evIdx = new Map();
+  for (const ev of [...evNodes].reverse()) {
+    const pl = ev.querySelector(".event-player");
+    const nm = cleanName(pl && pl.childNodes[0] ? pl.childNodes[0].textContent : "");
+    const kd = ev.querySelector("i.red-card") ? "red" : ev.querySelector("i.yellow-card") ? "yellow" : ev.querySelector("i.goal") || (ev.querySelector("i.fa-futbol") && !ev.querySelector("i.text-danger")) ? "goal" : "";
+    if (!kd) continue;
+    const k = (ev.classList.contains("side-away") ? "away" : "home") + "|" + kd + "|" + nm;
+    evIdx.set(ev, seenCount.get(k) || 0);
+    seenCount.set(k, (seenCount.get(k) || 0) + 1);
+  }
+  evNodes.forEach((ev) => {
     const minute = minuteValue((ev.querySelector(".event-minute") || {}).textContent);
     if (minute === null) return;
     const player = cleanName((ev.querySelector(".event-player") || {}).childNodes && ev.querySelector(".event-player").childNodes[0] ? ev.querySelector(".event-player").childNodes[0].textContent : "");
@@ -2012,10 +2053,8 @@ function updateVar(hash) {
     const isYellow = !isRed && !!ev.querySelector("i.yellow-card");
     const isGoal = !isRed && !isYellow && (!!ev.querySelector("i.goal") || (!!ev.querySelector("i.fa-futbol") && !ev.querySelector("i.text-danger")));
     if (!isGoal && !isRed && !isYellow) return;
-    const seed = `${hash}|var|${side}|${Math.floor(minute)}|${player}`;
-    const [u0, v] = seededRandoms(seed, 2);
     // goals from the spot are never overturned by VAR (penalties in play and in a shoot-out)
-    const u = isGoal && isPenaltyGoal(player, minute) ? 1 : u0;
+    const { seed, u, v } = varRoll(hash, side, isGoal ? "goal" : isRed ? "red" : "yellow", player, evIdx.get(ev) || 0, isGoal && isPenaltyGoal(player, minute));
     const tag = "var-" + side + "-" + Math.floor(minute) + "-" + player.replace(/\W+/g, "");
     const mn = Math.floor(minute);
     let overturned = null; // text of the VAR decision
@@ -2127,15 +2166,44 @@ function hideCancelledIcons(list) {
 }
 
 // ---- disallowed goals, remembered for the cup pages ----
-const VARGOAL_KEY = "msVarGoals1";
+const VARGOAL_KEY = "msVarGoals2";
 const loadVarGoals = () => { try { return JSON.parse(localStorage.getItem(VARGOAL_KEY) || "{}") || {}; } catch (e) { return {}; } };
+// the cup a page belongs to (a cup page URL, otherwise its breadcrumb / cup links)
+function cupIdOnPage() {
+  const m = /^\/cup\/(?:player-stats\/)?(\d+)/.exec(location.pathname);
+  if (m) return m[1];
+  const a = document.querySelector('a[href^="/cup/"]');
+  const mm = a && /\/cup\/(?:player-stats\/)?(\d+)/.exec(a.getAttribute("href"));
+  return mm ? mm[1] : "";
+}
+// saved decisions that belong to the cup being looked at (older ones without a cup id stay in)
+function varRecsHere(all) {
+  const cup = cupIdOnPage();
+  return Object.entries(all).filter(([, r]) => !r.cup || !cup || r.cup === cup);
+}
+
 function recordVarGoals(hash, list) {
-  if (!list.length) return;
+  if (!list.length) {
+    // the match was played again and nothing is cancelled any more: drop the old decision
+    if (currentMinute() === Infinity) {
+      const old = loadVarGoals();
+      if (old[hash]) {
+        delete old[hash];
+        try { localStorage.setItem(VARGOAL_KEY, JSON.stringify(old)); } catch (e) {}
+      }
+    }
+    return;
+  }
   const all = loadVarGoals();
   const info = sideInfo();
   const fx = fxGet(hash);
-  const teamOf = (side) => (info[side] && info[side].team) || (fx ? fx[side === "home" ? 1 : 3] : "");
-  const rec = { home: 0, away: 0, scorers: [], yellows: [], reds: [], assists: [], ht: teamOf("home"), at: teamOf("away") };
+  // the name shown over the team's crest is always there, even when the manager line has no club
+  const headName = (side) => {
+    const el = document.querySelector("." + side + "-team-name");
+    return el ? cleanName(el.textContent) : "";
+  };
+  const teamOf = (side) => (info[side] && info[side].team) || (fx ? fx[side === "home" ? 1 : 3] : "") || headName(side);
+  const rec = { home: 0, away: 0, scorers: [], yellows: [], reds: [], assists: [], ht: teamOf("home"), at: teamOf("away"), cup: cupIdOnPage(), watched: 1 };
   // the score the site itself gave the finished match, before the extension lowered it
   const orig = (id) => { const el = document.getElementById(id); return el && el.dataset.msBase !== undefined ? +el.dataset.msBase : null; };
   if (currentMinute() === Infinity) {
@@ -2156,6 +2224,8 @@ function recordVarGoals(hash, list) {
   // a decision that was made stays made
   const n = (r) => r ? r.scorers.length + (r.yellows || []).length + (r.reds || []).length + (r.assists || []).length : 0;
   if (old && n(old) > n(rec)) {
+    if (!old.ht && rec.ht) { old.ht = rec.ht; old.at = rec.at; }
+    if (!old.cup && rec.cup) old.cup = rec.cup;
     if (old.ho === undefined && rec.ho !== undefined) {
       old.ho = rec.ho; old.ao = rec.ao;
       try { localStorage.setItem(VARGOAL_KEY, JSON.stringify(all)); } catch (e) {}
@@ -2165,6 +2235,169 @@ function recordVarGoals(hash, list) {
   if (old && old.ho !== undefined && rec.ho === undefined) { rec.ho = old.ho; rec.ao = old.ao; }
   all[hash] = rec;
   try { localStorage.setItem(VARGOAL_KEY, JSON.stringify(all)); } catch (e) {}
+}
+
+// Records made by older builds lack the team names / the original score. Names come from the
+// fixture store; the original score is picked up later from a fixture link or a form tooltip.
+function varRecords() {
+  const all = loadVarGoals();
+  const list = [];
+  for (const [hash, r] of Object.entries(all)) {
+    if (!r.ht || !r.at) {
+      const fx = fxGet(hash);
+      if (fx) { r.ht = r.ht || fx[1]; r.at = r.at || fx[3]; }
+    }
+    list.push({ hash, r });
+  }
+  return list;
+}
+function saveVarRec(hash, r) {
+  const all = loadVarGoals();
+  all[hash] = r;
+  try { localStorage.setItem(VARGOAL_KEY, JSON.stringify(all)); } catch (e) {}
+}
+
+// the W/D/L badge next to a fixture result follows the lowered score
+function fixResultLetters() {
+  document.querySelectorAll("a[data-ms-orig][data-ms-shown]").forEach((a) => {
+    const tr = a.closest("tr");
+    const f = tr && tr.querySelector(".form-div");
+    if (!f || f.dataset.msVar) return;
+    const o = /^(\d+)-(\d+)$/.exec(a.dataset.msOrig), n = /^(\d+)-(\d+)$/.exec(a.dataset.msShown);
+    if (!o || !n) return;
+    const res = (x, y) => (x > y ? "W" : x < y ? "L" : "D");
+    const old = f.textContent.trim();
+    // which side is this page's team? the one whose old result letter fits
+    const home = res(+o[1], +o[2]) === old;
+    const away = res(+o[2], +o[1]) === old;
+    if (!home && !away) return;
+    const letter = home ? res(+n[1], +n[2]) : res(+n[2], +n[1]);
+    f.dataset.msVar = "1";
+    f.classList.remove("W", "D", "L");
+    f.classList.add(letter);
+    f.textContent = letter;
+  });
+}
+
+// ---- decisions for matches that were simulated from a cup page, without opening them ----
+// The match page's own HTML carries the events as data, so it is fetched once per match,
+// the same rolls are made, and the result is stored like an opened match.
+const VARSEEN_KEY = "msVarSeen2";
+const loadSeen = () => { try { return JSON.parse(localStorage.getItem(VARSEEN_KEY) || "{}") || {}; } catch (e) { return {}; } };
+const varInFlight = new Set();
+const retryAt = new Map();
+function varApplyAll() {
+  try { applyVarToCup(); applyVarToStatsPage(); applyVarToStandings(); } catch (e) {}
+}
+let varFetches = 0;
+
+function parseMatchEvents(html) {
+  const out = [];
+  let from = 0;
+  for (;;) {
+    const i = html.indexOf('{"id":', from);
+    if (i < 0) break;
+    from = i + 6;
+    if (!html.startsWith('"team_id"', html.indexOf(",", i) + 1)) continue;
+    let depth = 0, inStr = false, j = i;
+    for (; j < html.length; j++) {
+      const c = html[j];
+      if (inStr) { if (c === "\\") j++; else if (c === '"') inStr = false; }
+      else if (c === '"') inStr = true;
+      else if (c === "{") depth++;
+      else if (c === "}" && --depth === 0) break;
+    }
+    try { const o = JSON.parse(html.slice(i, j + 1)); if (o && o.event) out.push(o); } catch (e) {}
+    from = j + 1;
+  }
+  return out;
+}
+
+async function evaluateFinishedMatch(hash, href, cup) {
+  const res = await fetch(href, { credentials: "same-origin" });
+  if (!res.ok) throw new Error("http " + res.status);
+  const html = await res.text();
+  const events = parseMatchEvents(html);
+  if (!events.length) return null;
+  const sideOf = (e) => (e.side === "A" ? "away" : "home");
+  const names = { home: "", away: "" };
+  for (const e of events) if (e.team_name && !names[sideOf(e)]) names[sideOf(e)] = e.team_name;
+  const fx = fxGet(hash);
+  if (!names.home && fx) names.home = fx[1];
+  if (!names.away && fx) names.away = fx[3];
+  // The page's own score number is filled in by its script as the match is replayed, so the
+  // score is counted from the events instead: goals (an own goal counts for the side it is
+  // listed under), leaving out shoot-out kicks.
+  const tally = (side) => events.filter((e) => (e.event === "goal" || e.event === "ownGoal") && e.side === side && e.penalties_info == null).length;
+  const ho = tally("H"), ao = tally("A");
+  const rec = { home: 0, away: 0, scorers: [], yellows: [], reds: [], assists: [], ht: names.home, at: names.away, ho, ao, cup };
+  const counts = new Map();
+  for (const e of events) {
+    const kind = e.event === "goal" ? "goal" : e.event === "foulYellow" ? "yellow" : e.event === "foulRed" ? "red" : null;
+    if (!kind || !e.player_name) continue;
+    const side = sideOf(e);
+    const key = side + "|" + kind + "|" + e.player_name;
+    const idx = counts.get(key) || 0;
+    counts.set(key, idx + 1);
+    const isPen = kind === "goal" && (e.penalties_info != null || e.minute >= 120);
+    const { u } = varRoll(hash, side, kind, e.player_name, idx, isPen);
+    if (!varOverturned(kind, u)) continue;
+    const row = { p: e.player_name, team: names[side] };
+    if (kind === "goal") {
+      rec[side]++;
+      rec.scorers.push(row);
+      if (e.assisting_player_name) rec.assists.push({ p: e.assisting_player_name, team: names[side] });
+    } else if (kind === "yellow") rec.yellows.push(row);
+    else rec.reds.push(row);
+  }
+  return rec;
+}
+
+// the score a fixture link had from the site (before the extension lowered it)
+function origScore(a) {
+  const t = a.textContent.trim();
+  return a.dataset.msShown !== undefined && t === a.dataset.msShown && a.dataset.msOrig ? a.dataset.msOrig : t;
+}
+
+function autoVarScan() {
+  if (disabled || varFetches >= 3) return;
+  const seen = loadSeen();
+  const cup = cupIdOnPage();
+  for (const a of document.querySelectorAll('a[href*="/match/"]')) {
+    const m = /\/match\/([0-9a-f]{8,})\//.exec(a.getAttribute("href") || "");
+    if (!m || varInFlight.has(m[1])) continue;
+    // only finished matches: a fixture link that shows a result
+    let shownScore = origScore(a).replace(/\s+/g, "");
+    // a link that only says "View match" is a finished match too (the score is not shown yet)
+    if (/^view\s*match$/i.test(origScore(a))) shownScore = "";
+    else if (!/^\d+-\d+$/.test(shownScore)) continue;
+    // already evaluated for exactly this result; a live match whose score moved is looked at again
+    if (seen[m[1]] && (!shownScore || seen[m[1]] === shownScore)) continue;
+    if (retryAt.get(m[1]) > Date.now()) continue;
+    if (pageHash() === m[1]) continue; // the page being watched does its own
+    const hash = m[1];
+    varInFlight.add(hash);
+    varFetches++;
+    evaluateFinishedMatch(hash, a.getAttribute("href"), cup)
+      .then((rec) => {
+        // the data has to agree with the score on the page, otherwise the match is still being played
+        if (!rec || (shownScore && `${rec.ho}-${rec.ao}` !== shownScore)) { retryAt.set(hash, Date.now() + 2500); return; }
+        const s2 = loadSeen();
+        s2[hash] = shownScore || `${rec.ho}-${rec.ao}`;
+        try { localStorage.setItem(VARSEEN_KEY, JSON.stringify(s2)); } catch (e) {}
+        const all = loadVarGoals();
+        const any = rec.home || rec.away || rec.scorers.length || rec.yellows.length || rec.reds.length;
+        // a record made by watching the match itself is left alone, anything older is replaced
+        if (any && !(all[hash] && all[hash].watched && all[hash].ho === rec.ho && all[hash].ao === rec.ao)) all[hash] = rec;
+        else if (!any && all[hash] && !all[hash].watched) delete all[hash];
+        else return;
+        try { localStorage.setItem(VARGOAL_KEY, JSON.stringify(all)); } catch (e) {}
+        varApplyAll(); // show it straight away
+      })
+      .catch(() => { retryAt.set(hash, Date.now() + 5000); })
+      .then(() => { varInFlight.delete(hash); varFetches--; });
+    if (varFetches >= 3) break;
+  }
 }
 
 // cup page: lower the fixture results and the top-scorer table by the disallowed goals
@@ -2179,17 +2412,31 @@ function applyVarToCup() {
     if (a.dataset.msShown === cur) return;
     const mm = /^(\d+)\s*-\s*(\d+)$/.exec(cur);
     if (!mm) return;
+    // only when the page still shows the result the decision was made on
+    if (rec.ho !== undefined && (+mm[1] !== rec.ho || +mm[2] !== rec.ao)) return;
     const shown = Math.max(0, +mm[1] - rec.home) + "-" + Math.max(0, +mm[2] - rec.away);
     a.dataset.msOrig = cur;
     a.dataset.msShown = shown;
-    a.textContent = shown;
+    (a.querySelector("strong") || a).textContent = shown;
+    if (rec.ho === undefined) { rec.ho = +mm[1]; rec.ao = +mm[2]; saveVarRec(m[1], rec); }
   });
   for (const [boxId, field] of [["playerStatsGoals", "scorers"], ["playerStatsYellowCards", "yellows"], ["playerStatsRedCards", "reds"], ["playerStatsAssists", "assists"]]) {
     const table = document.querySelector("#" + boxId + " table");
     if (!table) continue;
     const cut = [];
-    for (const rec of Object.values(all)) for (const sc of rec[field] || []) cut.push(sc);
+    for (const [, rec] of varRecsHere(all)) for (const sc of rec[field] || []) cut.push(sc);
     if (!cut.length) continue;
+    // after the numbers dropped, the list is put back in order (most first, ties keep their order)
+    {
+      const rowsAll = [...table.querySelectorAll("tbody tr, tr")].filter((tr, i, a) => a.indexOf(tr) === i);
+      const val = (tr) => { const b = tr.querySelector("td:last-child b"); return b && /^\d+$/.test(b.textContent.trim()) && tr.cells.length >= 3 ? +b.textContent.trim() : null; };
+      const scored = rowsAll.filter((tr) => val(tr) !== null);
+      if (scored.length > 1 && scored.some((tr) => tr.querySelector("td:last-child b").dataset.msShown !== undefined)) {
+        const parent = scored[0].parentNode;
+        const sorted = scored.map((tr, i) => ({ tr, i })).sort((x, y) => val(y.tr) - val(x.tr) || x.i - y.i).map((o) => o.tr);
+        if (sorted.some((tr, i) => tr !== scored[i]) && scored.every((tr) => tr.parentNode === parent)) sorted.forEach((tr) => parent.appendChild(tr));
+      }
+    }
     let rank = 0;
     table.querySelectorAll("tr").forEach((tr) => {
       const b = tr.querySelector("td:last-child b");
@@ -2234,7 +2481,7 @@ function applyVarToStatsPage() {
         const txt = cell.textContent.trim();
         if (!/^\d+$/.test(txt) || cell.dataset.msShown === txt) continue;
         let n = 0;
-        for (const rec of Object.values(all)) for (const sc of rec[field] || []) if (sc.p === name && sameClubName(sc.team, team)) n++;
+        for (const [, rec] of varRecsHere(all)) for (const sc of rec[field] || []) if (sc.p === name && sameClubName(sc.team, team)) n++;
         if (!n) continue;
         const shown = String(Math.max(0, +txt - n));
         cell.dataset.msShown = shown;
@@ -2248,12 +2495,32 @@ function applyVarToStatsPage() {
 function applyVarToStandings() {
   const table = document.getElementById("leagueTable");
   if (!table) return;
-  const recs = Object.values(loadVarGoals()).filter((r) => r.ho !== undefined && r.ht && r.at);
+  const entries = varRecords();
+  // a record without its original score: take it from an untouched form tooltip
+  table.querySelectorAll(".form-div:not([data-ms-var])").forEach((dot) => {
+    const t = dot.getAttribute("data-bs-original-title") || dot.getAttribute("title") || "";
+    const m = /^(.*?) (\d+)-(\d+) (.*)$/.exec(t);
+    if (!m) return;
+    const e = entries.find((x) => x.r.ho === undefined && x.r.ht && x.r.at && sameClubName(x.r.ht, m[1]) && sameClubName(x.r.at, m[4]));
+    if (e) { e.r.ho = +m[2]; e.r.ao = +m[3]; saveVarRec(e.hash, e.r); }
+  });
+  const here = new Set(varRecsHere(Object.fromEntries(entries.map((e) => [e.hash, e.r]))).map(([h]) => h));
+  const recs = entries
+    .filter((e) => here.has(e.hash))
+    // a record with no cup id has to be proven by a link to its match on this page
+    .filter((e) => e.r.cup || document.querySelector(`a[href*="/match/${e.hash}"]`) || table.querySelector(".form-div"))
+    .map((e) => e.r)
+    .filter((r) => r.ho !== undefined && r.ht && r.at);
   if (!recs.length) return;
-  const heads = [...table.querySelectorAll("thead th")].map((th) => cleanName(th.textContent));
+  let heads = [...table.querySelectorAll("thead th")].map((th) => cleanName(th.textContent));
+  // the small table on a team page has no header: rank, team, played, points
+  if (!heads.length) {
+    const first = table.querySelector("tbody tr");
+    if (first && first.cells.length === 4) heads = ["", "Team", "P", "PTS"];
+  }
   const col = (n) => heads.indexOf(n);
-  const C = { W: col("W"), D: col("D"), L: col("L"), GF: col("GF"), GA: col("GA"), GD: col("GD"), PTS: col("PTS") };
-  if (C.GF < 0 || C.PTS < 0 || col("Team") < 0) return;
+  const C = { P: col("P"), W: col("W"), D: col("D"), L: col("L"), GF: col("GF"), GA: col("GA"), GD: col("GD"), PTS: col("PTS") };
+  if (C.PTS < 0 || col("Team") < 0) return;
   const res = (f, a) => (f > a ? "W" : f < a ? "L" : "D");
   const pts = { W: 3, D: 1, L: 0 };
   const rows = [...table.querySelectorAll("tbody tr")];
@@ -2273,9 +2540,19 @@ function applyVarToStandings() {
     const team = cleanName(tr.cells[col("Team")].textContent);
     const d = { W: 0, D: 0, L: 0, GF: 0, GA: 0, GD: 0, PTS: 0 };
     let hit = false;
+    // a stored result only counts if this row still shows that very result: its form dot
+    // carries the original score (the compact table has no dots, so it only gets the sanity check)
+    const dotTips = [...tr.querySelectorAll(".form-div")].map((dt) => dt.getAttribute("data-bs-original-title") || dt.getAttribute("title") || "");
+    const confirmed = (r) =>
+      !dotTips.length ||
+      dotTips.some((t) => {
+        const m = /^(.*?) (\d+)-(\d+) (.*)$/.exec(t);
+        return m && sameClubName(r.ht, m[1]) && sameClubName(r.at, m[4]) && r.ho === +m[2] && r.ao === +m[3];
+      });
     for (const r of recs) {
       for (const side of ["home", "away"]) {
         if (!sameClubName(side === "home" ? r.ht : r.at, team)) continue;
+        if (!confirmed(r)) continue;
         const other = side === "home" ? "away" : "home";
         const f0 = side === "home" ? r.ho : r.ao, a0 = side === "home" ? r.ao : r.ho;
         const f1 = Math.max(0, f0 - r[side]), a1 = Math.max(0, a0 - r[other]);
@@ -2286,6 +2563,12 @@ function applyVarToStandings() {
       }
     }
     if (!hit) continue;
+    // never produce a negative count (W, D, L, GF, GA, PTS, or P of 0): the table is not what the record saw
+    const played = C.P >= 0 ? +tr.cells[C.P].textContent.trim() : 1;
+    const cur = (k) => { const c = tr.cells[C[k]]; return c ? +((c.querySelector("b") || c).textContent.trim()) : NaN; };
+    const pIdx = C.P >= 0 ? C.P : 2;
+    const playedN = +tr.cells[pIdx].textContent.trim();
+    if (!(playedN > 0) || (C.PTS >= 0 && d.PTS && cur("PTS") + d.PTS > 3 * playedN) || ["W", "D", "L", "GF", "GA", "PTS"].some((k) => C[k] >= 0 && d[k] && cur(k) + d[k] < 0)) continue;
     for (const k of Object.keys(d)) if (C[k] >= 0 && bump(tr.cells[C[k]], d[k])) changed = true;
   }
   // the form dots: "Home 0-3 Away" with the result letter from this row's team

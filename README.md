@@ -34,3 +34,13 @@ the stadium, the referee or a captain armband to correct it. A round gear button
 - **Chrome for Android and Samsung Internet:** do not support extensions.
 - **iPhone / iPad:** Safari needs an app wrapper (Xcode on a Mac: `xcrun safari-web-extension-converter` on the extension folder);
   it cannot be installed from a zip.
+
+## Updating the extension
+
+Replace the files (or load the new zip) and reload the extension. Chrome / Edge / Brave then
+reload every open matchsimulator.com tab by themselves, and the extension starts the VAR data
+from scratch for the new version, so nothing from an older version stays wrong.
+Your own corrections (logos, managers, stadiums, captains) are kept.
+
+There is no automatic download of new versions: a private extension has no update server.
+In Firefox the same reload happens, but only if you granted the site permission in about:addons.
