@@ -841,7 +841,7 @@ function fixtureSlugTeams(img) {
 }
 
 async function processFlagImg(img) {
-  if (disabled) return;
+  if (disabled || !featureOn("logos")) return;
   let code = null;
   let bestName = null;
   const tryName = (t) => {
@@ -926,6 +926,7 @@ const io = new IntersectionObserver(
 function scan() {
   if (!ready || disabled) return;
   learnFixtures();
+  if (!featureOn("logos")) return;
   document.querySelectorAll('img[src*="/img/flags/"]:not([data-ms-flag])').forEach(processFlagImg);
   document.querySelectorAll(LOGO_SELECTOR).forEach((logo) => {
     if (logo.dataset[MARK]) {
@@ -1221,7 +1222,7 @@ function markCaptain(card, captain) {
 
 // The site redraws the pitch while simulating; put the armband back if it vanished.
 function reapplyCaptains() {
-  if (disabled) return;
+  if (disabled || !featureOn("details")) return;
   document.querySelectorAll(".card-header.d-flex[data-ms-captain]").forEach((header) => {
     const card = header.closest(".card");
     if (card && !card.querySelector(".ms-captain-badge")) markCaptain(card, header.dataset.msCaptain);
@@ -1303,14 +1304,14 @@ function processEditorSide(side) {
 }
 
 function processEditorPage() {
-  if (disabled) return;
+  if (disabled || !featureOn("details")) return;
   processEditorSide("home");
   processEditorSide("away");
 }
 
 // The lineup tab has no coach line, so one is added under each team's name.
 function processLineupCards() {
-  if (disabled) return;
+  if (disabled || !featureOn("details")) return;
   document.querySelectorAll(".card-header.d-flex").forEach((header) => {
     if (header.dataset.msCoachDone) return;
     const span = header.querySelector("span");
@@ -1349,7 +1350,7 @@ function pickPlace(parts, stadium) {
 
 let stadiumHome = "", stadiumText = "";
 function fillStadium() {
-  if (disabled) return;
+  if (disabled || !featureOn("details")) return;
   const el = document.querySelector(".stadium-name");
   if (!el) return;
   const names = homeAwayNamesFromPage() || matchTeams();
@@ -1595,7 +1596,7 @@ function refOverrides() {
 }
 
 function fillReferee() {
-  if (disabled) return;
+  if (disabled || !featureOn("details")) return;
   const slot = document.querySelector(".stadium-name");
   const hash = pageHash();
   const teams = homeAwayNamesFromPage() || matchTeams();
@@ -1744,15 +1745,7 @@ function addFeedEvent(tag, minute, kind, text) {
   content.textContent = text;
   item.append(marker, content);
   // newest first: go above the first item that is not later than this minute
-  let before = null;
-  for (const it of list.querySelectorAll(":scope > .timeline-item")) {
-    if (/match finished/i.test(it.textContent)) continue;
-    const t = it.querySelector(".timeline-item-marker-text");
-    const v = t ? minuteValue(t.textContent) : null;
-    if (v === null || v <= minute) { before = it; break; }
-  }
-  if (before) list.insertBefore(item, before);
-  else list.appendChild(item);
+  placeByMinute(list, item, minute);
 }
 
 function addSummaryEvent(tag, minute, kind, side, label) {
@@ -1773,13 +1766,49 @@ function addSummaryEvent(tag, minute, kind, side, label) {
   pl.className = "event-player";
   pl.textContent = label;
   ev.append(mn, ic, pl);
+  placeByMinute(box, ev, minute);
+}
+
+// Our own entries are put where their minute belongs (newest first). The site builds its
+// timeline in steps, so an entry added early can end up below events that arrive later;
+// settleOrder() moves it again whenever it is out of place.
+const SUM_MINUTE = (e) => minuteValue((e.querySelector(".event-minute") || {}).textContent);
+const FEED_MINUTE = (it) => {
+  if (/match finished/i.test(it.textContent)) return null;
+  const t = it.querySelector(".timeline-item-marker-text");
+  return t ? minuteValue(t.textContent) : null;
+};
+function placeByMinute(box, ev, minute) {
+  const feed = ev.classList.contains("timeline-item");
+  const sel = feed ? ".timeline-item" : ".timeline-event";
+  const get = feed ? FEED_MINUTE : SUM_MINUTE;
   let before = null;
-  for (const e of box.querySelectorAll(":scope > .timeline-event")) {
-    const v = minuteValue((e.querySelector(".event-minute") || {}).textContent);
-    if (v === null || v <= minute) { before = e; break; }
+  for (const e of box.querySelectorAll(":scope > " + sel)) {
+    if (e === ev) continue;
+    const v = get(e);
+    if (v !== null && v <= minute) { before = e; break; }
   }
+  // not found: after the last readable event (older than all), or at the end
   if (before) box.insertBefore(ev, before);
   else box.appendChild(ev);
+}
+function settleOrder() {
+  for (const [boxSel, sel, get] of [["#timelineContainer", ".timeline-event", SUM_MINUTE], ["#feedTab .timeline", ".timeline-item", FEED_MINUTE]]) {
+    const box = document.querySelector(boxSel);
+    if (!box) continue;
+    const items = [...box.querySelectorAll(":scope > " + sel)];
+    items.filter((e) => e.dataset.msCoach).forEach((ev) => {
+      const mine = get(ev);
+      if (mine === null) return;
+      const idx = items.indexOf(ev);
+      const wrong = items.some((o, i) => {
+        if (o === ev) return false;
+        const v = get(o);
+        return v !== null && ((i < idx && v < mine) || (i > idx && v > mine));
+      });
+      if (wrong) { placeByMinute(box, ev, mine); items.splice(0, items.length, ...box.querySelectorAll(":scope > " + sel)); }
+    });
+  }
 }
 
 // team + manager of each side, from the Lineups tab
@@ -1849,6 +1878,7 @@ function recordSuspension(hash, side, b) {
 
 // served: the team has played its next match
 function expireSuspensions(hash) {
+  if (!featureOn("cards")) return;
   if (currentMinute() !== Infinity) return;
   const fx = fxGet(hash);
   if (!fx) return;
@@ -1865,38 +1895,68 @@ function expireSuspensions(hash) {
 }
 
 function updateSuspensionTable() {
+  if (!featureOn("cards")) return;
   const tbody = document.querySelector("#availabilityTypeSuspensions tbody");
   if (!tbody) return;
+  const table = tbody.closest("table");
+  // the columns follow the page: the cup page has Name, Team, Until; a team page only Name, Until
+  const heads = [...table.querySelectorAll("thead th")].map((th) => cleanName(th.textContent).toLowerCase());
+  const cols = heads.length ? heads : ["name", "team", "until"];
+  const hasTeam = cols.includes("team");
   const all = loadSusp();
   const cupNow = (location.pathname.match(/^\/cup\/(\d+)/) || [])[1] || "";
+  // on a team page only that team's suspensions belong in the table
+  const teamPage = /\/team\/([^/]+)\/([^/?#]*)/.exec(location.pathname);
+  const sameTeamPage = (r) => {
+    if (!teamPage) return true;
+    const key = r.key || "";
+    if (key && key.startsWith("t" + decodeURIComponent(teamPage[1]) + ":")) return true;
+    return slugOf(stripTag(r.team || "")) === slugOf(decodeURIComponent(teamPage[2]));
+  };
   const anchors = [...document.querySelectorAll('a[href*="/team/"]')];
   tbody.querySelectorAll("tr[data-ms-susp]").forEach((tr) => {
-    if (!all[tr.dataset.msSusp]) tr.remove();
+    if (!all[tr.dataset.msSusp] || !sameTeamPage(all[tr.dataset.msSusp])) tr.remove();
   });
+  const nameIx = Math.max(0, cols.indexOf("name"));
+  const teamIx = cols.indexOf("team");
   for (const [id, r] of Object.entries(all)) {
     if (r.cup && cupNow && r.cup !== cupNow) continue;
+    if (!sameTeamPage(r)) continue;
     if (tbody.querySelector(`tr[data-ms-susp="${id}"]`)) continue;
-    const a = anchors.find((x) => {
-      const t = teamFromAnchor(x);
-      return t && ((r.key && t.key === r.key) || (!r.key && sameClubName(t.name, r.team)));
-    });
-    if (!a) continue;
-    if ([...tbody.querySelectorAll("tr")].some((tr) => cleanName(tr.cells[0] && tr.cells[0].textContent) === r.p && tr.cells[1] && sameClubName(tr.cells[1].textContent, r.team))) continue;
+    let href = "";
+    if (hasTeam) {
+      const a = anchors.find((x) => {
+        const t = teamFromAnchor(x);
+        return t && ((r.key && t.key === r.key) || (!r.key && sameClubName(t.name, r.team)));
+      });
+      if (!a) continue; // the team is not on this page
+      href = a.getAttribute("href");
+    }
+    const same = [...tbody.querySelectorAll("tr")].some(
+      (tr) =>
+        tr.cells[nameIx] &&
+        cleanName(tr.cells[nameIx].textContent) === r.p &&
+        (!hasTeam || (tr.cells[teamIx] && sameClubName(tr.cells[teamIx].textContent, r.team)))
+    );
+    if (same) continue;
     const tr = document.createElement("tr");
     tr.dataset.msSusp = id;
-    const td1 = document.createElement("td");
-    td1.textContent = r.p;
-    const td2 = document.createElement("td");
-    const link = document.createElement("a");
-    link.href = a.getAttribute("href");
-    link.className = "text-black fw-normal";
-    link.textContent = r.team || cleanName(a.textContent);
-    td2.appendChild(link);
-    const td3 = document.createElement("td");
-    const bold = document.createElement("b");
-    bold.textContent = "Next match";
-    td3.appendChild(bold);
-    tr.append(td1, td2, td3);
+    cols.forEach((c) => {
+      const td = document.createElement("td");
+      if (c === "name") td.textContent = r.p;
+      else if (c === "team") {
+        const link = document.createElement("a");
+        link.href = href;
+        link.className = "text-black fw-normal";
+        link.textContent = r.team || "";
+        td.appendChild(link);
+      } else if (c === "until") {
+        const bold = document.createElement("b");
+        bold.textContent = "Next match";
+        td.appendChild(bold);
+      }
+      tr.appendChild(td);
+    });
     tbody.appendChild(tr);
   }
 }
@@ -2259,6 +2319,7 @@ function saveVarRec(hash, r) {
 
 // the W/D/L badge next to a fixture result follows the lowered score
 function fixResultLetters() {
+  if (!featureOn("var")) return;
   document.querySelectorAll("a[data-ms-orig][data-ms-shown]").forEach((a) => {
     const tr = a.closest("tr");
     const f = tr && tr.querySelector(".form-div");
@@ -2287,6 +2348,7 @@ const loadSeen = () => { try { return JSON.parse(localStorage.getItem(VARSEEN_KE
 const varInFlight = new Set();
 const retryAt = new Map();
 function varApplyAll() {
+  if (!featureOn("var")) return;
   try { applyVarToCup(); applyVarToStatsPage(); applyVarToStandings(); } catch (e) {}
 }
 let varFetches = 0;
@@ -2360,7 +2422,7 @@ function origScore(a) {
 }
 
 function autoVarScan() {
-  if (disabled || varFetches >= 3) return;
+  if (disabled || !featureOn("var") || varFetches >= 3) return;
   const seen = loadSeen();
   const cup = cupIdOnPage();
   for (const a of document.querySelectorAll('a[href*="/match/"]')) {
@@ -2402,6 +2464,7 @@ function autoVarScan() {
 
 // cup page: lower the fixture results and the top-scorer table by the disallowed goals
 function applyVarToCup() {
+  if (!featureOn("var")) return;
   const all = loadVarGoals();
   if (!Object.keys(all).length) return;
   document.querySelectorAll('a[href*="/match/"]').forEach((a) => {
@@ -2466,6 +2529,7 @@ function applyVarToCup() {
 
 // the full "Player stats" page: one row per player with G / A / YC / RC columns
 function applyVarToStatsPage() {
+  if (!featureOn("var")) return;
   const all = loadVarGoals();
   if (!Object.keys(all).length) return;
   document.querySelectorAll("table").forEach((table) => {
@@ -2493,6 +2557,7 @@ function applyVarToStatsPage() {
 
 // league table: goals for/against, results and points follow the disallowed goals
 function applyVarToStandings() {
+  if (!featureOn("var")) return;
   const table = document.getElementById("leagueTable");
   if (!table) return;
   const entries = varRecords();
@@ -2616,7 +2681,8 @@ function updateCoachCards() {
   state.away = state.away || { y: 0, r: 0 };
   let changed = false;
   const now = currentMinute();
-  document.querySelectorAll(".ms-coach").forEach((line) => {
+  const cardsOn = featureOn("cards");
+  document.querySelectorAll(cardsOn ? ".ms-coach" : ".ms-none").forEach((line) => {
     const card = line.previousElementSibling && line.previousElementSibling.closest(".card");
     if (!card) return;
     const side = card.querySelector('[id^="playerH"]') ? "home" : card.querySelector('[id^="playerA"]') ? "away" : null;
@@ -2656,8 +2722,9 @@ function updateCoachCards() {
       "display:inline-block;width:9px;height:13px;margin-left:6px;border-radius:2px;vertical-align:-2px;" +
       "background:" + (level === 2 ? "#d62828" : "#f4c20d") + ";box-shadow:0 0 0 1px rgba(0,0,0,.25);";
   });
-  if (updateBenchCards(hash, now, state)) changed = true;
-  updateVar(hash);
+  if (cardsOn && updateBenchCards(hash, now, state)) changed = true;
+  if (featureOn("var")) updateVar(hash);
+  settleOrder();
   if (changed) {
     all[hash] = state;
     const keys = Object.keys(all);
@@ -2670,7 +2737,15 @@ function updateCoachCards() {
 // Accounts with premium get the site's own look: the extension stays off for them.
 // "auto" detects it from the page (a locked "Simulate matchday" button = no premium);
 // the mode can also be forced on or off in the settings panel (Alt+Shift+L).
-let settings = { mode: "auto", premium: null };
+let settings = { mode: "auto", premium: null, features: {} };
+// What the extension adds can be chosen one by one (settings panel). Everything is on by default.
+const FEATURES = [
+  ["logos", "Club logos and nation flags", "The real crests and flags."],
+  ["details", "Stadium, manager, captain and referee", "Stadium with place, manager line, captain armband, referee."],
+  ["cards", "Coach and bench cards, suspensions", "Cards for managers and unused substitutes, and the bans that follow. (Coach cards need the manager line above.)"],
+  ["var", "VAR checks and decisions", "VAR reviews, cancelled goals and cards, and the matching changes in standings and stats."],
+];
+const featureOn = (k) => !settings.features || settings.features[k] !== false;
 const computeDisabled = () => settings.mode === "off" || (settings.mode === "auto" && settings.premium === true);
 
 function detectPremium() {
@@ -2692,6 +2767,11 @@ function detectPremium() {
       if (computeDisabled() !== was) location.reload();
     });
   } catch (e) {}
+}
+
+function saveFeature(key, on) {
+  settings.features = Object.assign({}, settings.features, { [key]: on });
+  chrome.storage.local.set({ msSettings: settings }, () => location.reload());
 }
 
 function saveMode(mode) {
@@ -2738,6 +2818,20 @@ function openSettings() {
   });
   sel.addEventListener("change", () => saveMode(sel.value));
   box.appendChild(sel);
+
+  box.append(el("div", "font-weight:600;margin:4px 0 6px;", "What to add"));
+  FEATURES.forEach(([key, title, hint]) => {
+    const row = el("label", "display:flex;gap:8px;align-items:flex-start;margin-bottom:8px;cursor:pointer;");
+    const cb = el("input", "margin-top:3px;flex:none;");
+    cb.type = "checkbox";
+    cb.checked = featureOn(key);
+    cb.addEventListener("change", () => saveFeature(key, cb.checked));
+    const txt = el("span", "");
+    txt.append(el("span", "display:block;", title), el("span", "display:block;color:#666;font-size:12px;", hint));
+    row.append(cb, txt);
+    box.appendChild(row);
+  });
+  box.append(el("div", "color:#666;font-size:12px;margin-bottom:8px;", "Changing a choice reloads the page."));
 
   const btns = el("div", "display:flex;flex-direction:column;gap:6px;");
   const resetBtn = el("button", "padding:7px 10px;cursor:pointer;", "Reset all logos");
