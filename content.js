@@ -1418,37 +1418,98 @@ new MutationObserver(() => {
 // in-place change is seen above, so the VAR changes are also re-checked now and then.
 setInterval(() => {
   if (disabled || document.hidden) return;
-  try { autoVarScan(); varApplyAll(); fixResultLetters(); addCupFormOptions(); } catch (e) {}
+  try { autoVarScan(); varApplyAll(); fixResultLetters(); addCupFormOptions(); claimPending(); } catch (e) {}
 }, 1500);
 
-// "Create cup" page: the extension's options sit in the form next to the site's own
-// checkboxes (home advantage, injuries, suspensions, private). They are the same switches
-// as in the settings panel, saved as soon as they are ticked (no reload needed here).
-function addCupFormOptions() {
-  if (!/^\/cup\/new\/?$/.test(location.pathname) || loaded < 5) return;
-  if (document.getElementById("ms-cup-options")) return;
-  const priv = document.getElementById("inputPrivate");
-  const anchor = priv && priv.closest(".form-check");
-  if (!anchor) return;
+// ---------- options per cup / per quick match ----------
+// The Create cup form and the Quick match page get the extension's options. The choice is kept
+// as "pending" until the site has made the cup (or match); the first /cup/<id> (or /match/<hash>)
+// page opened afterwards claims it. Everything without its own choice follows the global
+// settings (Alt+Shift+L).
+const SCOPE_KEY = "msScopeOpts";
+const OPTS_PENDING_KEY = "msPendingOpts";
+const PENDING_TTL = 10 * 60 * 1000;
+let scopeOpts = {};
+let scopeCache = { href: "", id: "", t: 0 };
+
+function scopeId() {
+  const p = location.pathname;
+  let m = /^\/cup\/(?:player-stats\/)?(\d+)/.exec(p);
+  if (m) return "cup:" + m[1];
+  if (!/^\/(?:match|fixture)\//.test(p)) return "";
+  if (scopeCache.href === location.href && (scopeCache.id || Date.now() - scopeCache.t < 1500)) return scopeCache.id;
+  let id = "";
+  // a match of a cup links back to its cup somewhere in the page content (not the side menu)
+  const a = document.querySelector('main a[href^="/cup/"]');
+  m = a && /\/cup\/(?:player-stats\/)?(\d+)/.exec(a.getAttribute("href"));
+  if (m) id = "cup:" + m[1];
+  else if ((m = /^\/match\/([0-9a-f]+)/.exec(p))) id = "match:" + m[1];
+  scopeCache = { href: location.href, id, t: Date.now() };
+  return id;
+}
+
+const featureOn = (k) => {
+  const own = scopeOpts[scopeId()];
+  if (own && typeof own[k] === "boolean") return own[k];
+  return !settings.features || settings.features[k] !== false;
+};
+
+function saveScopeOpts() {
+  try { chrome.storage.local.set({ [SCOPE_KEY]: scopeOpts }); } catch (e) {}
+}
+
+function setPending(scope, opts) {
+  try { chrome.storage.local.set({ [OPTS_PENDING_KEY]: { scope, opts, t: Date.now() } }); } catch (e) {}
+}
+
+// the page that follows the create form claims the saved choice
+let pendingBusy = false;
+function claimPending() {
+  if (pendingBusy || loaded < 6) return;
+  const p = location.pathname;
+  let want = "", id = "", m;
+  if ((m = /^\/cup\/(\d+)/.exec(p))) { want = "cup"; id = "cup:" + m[1]; }
+  else if ((m = /^\/match\/([0-9a-f]+)/.exec(p))) { want = "match"; id = "match:" + m[1]; }
+  if (!want || scopeOpts[id]) return;
+  pendingBusy = true;
+  try {
+    chrome.storage.local.get(OPTS_PENDING_KEY, (r) => {
+      const pd = r && r[OPTS_PENDING_KEY];
+      if (pd && pd.scope === want && Date.now() - pd.t < PENDING_TTL && !scopeOpts[id]) {
+        scopeOpts[id] = pd.opts;
+        saveScopeOpts();
+        try { chrome.storage.local.remove(OPTS_PENDING_KEY); } catch (e) {}
+        scopeCache = { href: "", id: "", t: 0 };
+      }
+      pendingBusy = false;
+    });
+  } catch (e) { pendingBusy = false; }
+}
+
+function buildOptionsBlock(idBase, scope, note) {
   const wrap = document.createElement("div");
-  wrap.id = "ms-cup-options";
-  wrap.className = "mt-3";
+  wrap.id = idBase;
+  wrap.className = "mt-3 mb-2";
   const head = document.createElement("div");
   head.className = "small fw-600 mb-1";
   head.textContent = "Club Logos extension";
   wrap.appendChild(head);
+  const cbs = {};
+  const push = () => {
+    const o = {};
+    FEATURES.forEach(([k]) => { o[k] = cbs[k].checked; });
+    setPending(scope, o);
+  };
   FEATURES.forEach(([key, title, hint]) => {
     const row = document.createElement("div");
     row.className = "form-check";
     const cb = document.createElement("input");
     cb.className = "form-check-input";
     cb.type = "checkbox";
-    cb.id = "ms-opt-" + key;
-    cb.checked = featureOn(key);
-    cb.addEventListener("change", () => {
-      settings.features = Object.assign({}, settings.features, { [key]: cb.checked });
-      try { chrome.storage.local.set({ msSettings: settings }); } catch (e) {}
-    });
+    cb.id = idBase + "-" + key;
+    cb.checked = settings.features ? settings.features[key] !== false : true;
+    cb.addEventListener("change", push);
+    cbs[key] = cb;
     const lab = document.createElement("label");
     lab.className = "form-check-label";
     lab.htmlFor = cb.id;
@@ -1456,11 +1517,40 @@ function addCupFormOptions() {
     row.append(cb, lab);
     wrap.appendChild(row);
   });
-  const note = document.createElement("div");
-  note.className = "text-xs text-muted mt-1";
-  note.textContent = "These apply to all your cups and can also be changed with Alt+Shift+L.";
-  wrap.appendChild(note);
-  anchor.insertAdjacentElement("afterend", wrap);
+  const nt = document.createElement("div");
+  nt.className = "text-xs text-muted mt-1";
+  nt.textContent = note;
+  wrap.appendChild(nt);
+  push(); // the defaults count even when nothing is ticked
+  const form = () => wrap.closest("form");
+  setTimeout(() => { const f = form(); if (f) f.addEventListener("submit", push, true); }, 0);
+  return wrap;
+}
+
+function addCupFormOptions() {
+  if (loaded < 6) return;
+  const p = location.pathname;
+  if (/^\/cup\/new\/?$/.test(p)) {
+    if (document.getElementById("ms-cup-options")) return;
+    const priv = document.getElementById("inputPrivate");
+    const anchor = priv && priv.closest(".form-check");
+    if (!anchor) return;
+    anchor.insertAdjacentElement(
+      "afterend",
+      buildOptionsBlock("ms-cup-options", "cup", "Only for this cup. The starting choices come from the settings panel (Alt+Shift+L).")
+    );
+  } else if (/^\/setup\/?$/.test(p)) {
+    if (document.getElementById("ms-match-options")) return;
+    const forms = [...document.querySelectorAll("form")].filter((f) => f.querySelector("select, input:not([type=hidden])"));
+    const form = forms.find((f) => f.querySelector('button[type="submit"], input[type="submit"], button:not([type])')) || forms[0];
+    if (!form) return;
+    const last = [...form.querySelectorAll(".form-check")].pop();
+    const btn = form.querySelector('button[type="submit"], input[type="submit"], button:not([type])');
+    const block = buildOptionsBlock("ms-match-options", "match", "Only for this quick match. The starting choices come from the settings panel (Alt+Shift+L).");
+    if (last) last.insertAdjacentElement("afterend", block);
+    else if (btn) (btn.parentElement === form ? btn : btn.parentElement).insertAdjacentElement("beforebegin", block);
+    else form.appendChild(block);
+  }
 }
 
 // While a cup is being simulated, the site reuses existing flag <img>
@@ -2787,11 +2877,10 @@ const FEATURES = [
   ["cards", "Coach and bench cards, suspensions", "Cards for managers and unused substitutes, and the bans that follow. (Coach cards need the manager line above.)"],
   ["var", "VAR checks and decisions", "VAR reviews, cancelled goals and cards, and the matching changes in standings and stats."],
 ];
-const featureOn = (k) => !settings.features || settings.features[k] !== false;
 const computeDisabled = () => settings.mode === "off" || (settings.mode === "auto" && settings.premium === true);
 
 function detectPremium() {
-  if (loaded < 5 || settings.mode !== "auto") return; // wait until the saved settings are read
+  if (loaded < 6 || settings.mode !== "auto") return; // wait until the saved settings are read
   let found = null;
   if (document.querySelector('[data-bs-target="#premiumRequiredModal"]')) {
     found = false; // a premium-locked control is on screen: no premium
@@ -2873,6 +2962,31 @@ function openSettings() {
     row.append(cb, txt);
     box.appendChild(row);
   });
+  const sid = scopeId();
+  if (sid) {
+    const isCup = sid.startsWith("cup:");
+    box.append(el("div", "font-weight:600;margin:10px 0 2px;", isCup ? "Only this cup" : "Only this match"));
+    const own = scopeOpts[sid] || {};
+    box.append(el("div", "color:#666;font-size:12px;margin-bottom:6px;", Object.keys(own).length ? "These choices override the ones above." : "Not set: this follows the choices above."));
+    FEATURES.forEach(([key, title]) => {
+      const row = el("label", "display:flex;gap:8px;align-items:center;margin-bottom:6px;cursor:pointer;");
+      const cb = el("input", "flex:none;");
+      cb.type = "checkbox";
+      cb.checked = featureOn(key);
+      cb.addEventListener("change", () => {
+        scopeOpts[sid] = Object.assign({}, scopeOpts[sid] || {}, { [key]: cb.checked });
+        saveScopeOpts();
+        setTimeout(() => location.reload(), 150);
+      });
+      row.append(cb, el("span", "", title));
+      box.appendChild(row);
+    });
+    if (scopeOpts[sid]) {
+      const clr = el("button", "padding:5px 10px;cursor:pointer;margin-bottom:8px;", "Follow the general choices again");
+      clr.addEventListener("click", () => { delete scopeOpts[sid]; saveScopeOpts(); setTimeout(() => location.reload(), 150); });
+      box.appendChild(clr);
+    }
+  }
   box.append(el("div", "color:#666;font-size:12px;margin-bottom:8px;", "Changing a choice reloads the page."));
 
   const btns = el("div", "display:flex;flex-direction:column;gap:6px;");
@@ -2979,7 +3093,7 @@ else document.addEventListener("DOMContentLoaded", addTouchUi);
 
 let loaded = 0;
 const onLoaded = () => {
-  if (++loaded < 5) return;
+  if (++loaded < 6) return;
   disabled = computeDisabled();
   if (disabled) return;
   ready = true;
@@ -2991,6 +3105,14 @@ fixtureTeams.load(onLoaded);
 try {
   chrome.storage.local.get(INFO_OV_KEY, (r) => {
     infoOv = (r && r[INFO_OV_KEY]) || {};
+    onLoaded();
+  });
+} catch (e) {
+  onLoaded();
+}
+try {
+  chrome.storage.local.get(SCOPE_KEY, (r) => {
+    scopeOpts = (r && r[SCOPE_KEY]) || {};
     onLoaded();
   });
 } catch (e) {
