@@ -1418,8 +1418,50 @@ new MutationObserver(() => {
 // in-place change is seen above, so the VAR changes are also re-checked now and then.
 setInterval(() => {
   if (disabled || document.hidden) return;
-  try { autoVarScan(); varApplyAll(); fixResultLetters(); } catch (e) {}
+  try { autoVarScan(); varApplyAll(); fixResultLetters(); addCupFormOptions(); } catch (e) {}
 }, 1500);
+
+// "Create cup" page: the extension's options sit in the form next to the site's own
+// checkboxes (home advantage, injuries, suspensions, private). They are the same switches
+// as in the settings panel, saved as soon as they are ticked (no reload needed here).
+function addCupFormOptions() {
+  if (!/^\/cup\/new\/?$/.test(location.pathname) || loaded < 5) return;
+  if (document.getElementById("ms-cup-options")) return;
+  const priv = document.getElementById("inputPrivate");
+  const anchor = priv && priv.closest(".form-check");
+  if (!anchor) return;
+  const wrap = document.createElement("div");
+  wrap.id = "ms-cup-options";
+  wrap.className = "mt-3";
+  const head = document.createElement("div");
+  head.className = "small fw-600 mb-1";
+  head.textContent = "Club Logos extension";
+  wrap.appendChild(head);
+  FEATURES.forEach(([key, title, hint]) => {
+    const row = document.createElement("div");
+    row.className = "form-check";
+    const cb = document.createElement("input");
+    cb.className = "form-check-input";
+    cb.type = "checkbox";
+    cb.id = "ms-opt-" + key;
+    cb.checked = featureOn(key);
+    cb.addEventListener("change", () => {
+      settings.features = Object.assign({}, settings.features, { [key]: cb.checked });
+      try { chrome.storage.local.set({ msSettings: settings }); } catch (e) {}
+    });
+    const lab = document.createElement("label");
+    lab.className = "form-check-label";
+    lab.htmlFor = cb.id;
+    lab.textContent = title + ": " + hint;
+    row.append(cb, lab);
+    wrap.appendChild(row);
+  });
+  const note = document.createElement("div");
+  note.className = "text-xs text-muted mt-1";
+  note.textContent = "These apply to all your cups and can also be changed with Alt+Shift+L.";
+  wrap.appendChild(note);
+  anchor.insertAdjacentElement("afterend", wrap);
+}
 
 // While a cup is being simulated, the site reuses existing flag <img>
 // elements and just changes their "src" as fixtures update live, instead of
