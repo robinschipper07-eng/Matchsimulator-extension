@@ -1419,7 +1419,7 @@ new MutationObserver(() => {
 setInterval(() => {
   if (disabled || document.hidden) return;
   try { autoVarScan(); varApplyAll(); fixResultLetters(); addCupFormOptions(); claimPending(); } catch (e) {}
-}, 1500);
+}, 1000);
 
 // ---------- options per cup / per quick match ----------
 // The Create cup form and the Quick match page get the extension's options. The choice is kept
@@ -2507,12 +2507,42 @@ function parseMatchEvents(html) {
   return out;
 }
 
-async function evaluateFinishedMatch(hash, href, cup) {
+async function evaluateFinishedMatch(hash, href, cup, shown) {
   const res = await fetch(href, { credentials: "same-origin" });
   if (!res.ok) throw new Error("http " + res.status);
   const html = await res.text();
-  const events = parseMatchEvents(html);
+  let events = parseMatchEvents(html);
   if (!events.length) return null;
+  // The page carries the whole match. When the fixture list is still showing a running score
+  // (a live match), only the events up to that score count, so decisions appear while it is played.
+  const isGoal = (e) => (e.event === "goal" || e.event === "ownGoal") && e.penalties_info == null;
+  let partial = false;
+  const sm = shown && /^(\d+)-(\d+)$/.exec(shown);
+  if (sm) {
+    events = events
+      .map((e, i) => [e, i])
+      .sort((x, y) => (+x[0].minute || 0) - (+y[0].minute || 0) || x[1] - y[1])
+      .map((x) => x[0]);
+    const want = [+sm[1], +sm[2]];
+    const fullH = events.filter((e) => isGoal(e) && e.side === "H").length;
+    const fullA = events.filter((e) => isGoal(e) && e.side === "A").length;
+    if (fullH !== want[0] || fullA !== want[1]) {
+      if (fullH < want[0] || fullA < want[1]) return null; // page behind the list: try again soon
+      let h = 0, a = 0, cut = -1;
+      if (h === want[0] && a === want[1]) cut = 0;
+      for (let i = 0; i < events.length && cut < 0; i++) {
+        if (isGoal(events[i])) { if (events[i].side === "H") h++; else a++; }
+        if (h === want[0] && a === want[1]) {
+          // keep everything up to and including this goal, and any card in the same minute
+          cut = i + 1;
+          while (cut < events.length && !isGoal(events[cut]) && events[cut].minute === events[i].minute) cut++;
+        }
+      }
+      if (cut < 0) return null;
+      events = events.slice(0, cut);
+      partial = true;
+    }
+  }
   const sideOf = (e) => (e.side === "A" ? "away" : "home");
   const names = { home: "", away: "" };
   for (const e of events) if (e.team_name && !names[sideOf(e)]) names[sideOf(e)] = e.team_name;
@@ -2525,6 +2555,7 @@ async function evaluateFinishedMatch(hash, href, cup) {
   const tally = (side) => events.filter((e) => (e.event === "goal" || e.event === "ownGoal") && e.side === side && e.penalties_info == null).length;
   const ho = tally("H"), ao = tally("A");
   const rec = { home: 0, away: 0, scorers: [], yellows: [], reds: [], assists: [], ht: names.home, at: names.away, ho, ao, cup };
+  if (partial) rec.partial = true;
   const counts = new Map();
   for (const e of events) {
     const kind = e.event === "goal" ? "goal" : e.event === "foulYellow" ? "yellow" : e.event === "foulRed" ? "red" : null;
@@ -2554,7 +2585,7 @@ function origScore(a) {
 }
 
 function autoVarScan() {
-  if (disabled || !featureOn("var") || varFetches >= 3) return;
+  if (disabled || !featureOn("var") || varFetches >= 6) return;
   const seen = loadSeen();
   const cup = cupIdOnPage();
   for (const a of document.querySelectorAll('a[href*="/match/"]')) {
@@ -2572,10 +2603,10 @@ function autoVarScan() {
     const hash = m[1];
     varInFlight.add(hash);
     varFetches++;
-    evaluateFinishedMatch(hash, a.getAttribute("href"), cup)
+    evaluateFinishedMatch(hash, a.getAttribute("href"), cup, shownScore)
       .then((rec) => {
         // the data has to agree with the score on the page, otherwise the match is still being played
-        if (!rec || (shownScore && `${rec.ho}-${rec.ao}` !== shownScore)) { retryAt.set(hash, Date.now() + 2500); return; }
+        if (!rec || (shownScore && `${rec.ho}-${rec.ao}` !== shownScore)) { retryAt.set(hash, Date.now() + 1500); return; }
         const s2 = loadSeen();
         s2[hash] = shownScore || `${rec.ho}-${rec.ao}`;
         try { localStorage.setItem(VARSEEN_KEY, JSON.stringify(s2)); } catch (e) {}
@@ -2589,8 +2620,8 @@ function autoVarScan() {
         varApplyAll(); // show it straight away
       })
       .catch(() => { retryAt.set(hash, Date.now() + 5000); })
-      .then(() => { varInFlight.delete(hash); varFetches--; });
-    if (varFetches >= 3) break;
+      .then(() => { varInFlight.delete(hash); varFetches--; setTimeout(autoVarScan, 50); });
+    if (varFetches >= 6) break;
   }
 }
 
