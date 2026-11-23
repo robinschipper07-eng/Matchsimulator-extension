@@ -1309,6 +1309,208 @@ function processEditorPage() {
   processEditorSide("away");
 }
 
+
+// ---------- shirts in the lineup lists ----------
+// Every player in a team's list gets a small shirt. The colour is the one the pitch above uses
+// for that player (so goalkeepers differ); outfield players use the real home kit from Wikipedia
+// (body, sleeves, simple stripes/hoops/sash/halves read from the pattern name) when it is known.
+const SHIRT_WORDS = { white: "#ffffff", black: "#111111", red: "#d01020", blue: "#1646b8", navy: "#0b1f5c", sky: "#6ab4e8", yellow: "#f5d90a", gold: "#d4a017", orange: "#f07a10", green: "#12994a", purple: "#5c2a9d", maroon: "#7a1230", claret: "#7a1230", pink: "#f080b0", grey: "#8a8f98", gray: "#8a8f98" };
+const kitCache = new Map();
+const kitImgCache = new Map();
+const kitHtmlCache = new Map();
+// the grey the kit template shows when a page has no real colours
+const isPlaceholderKit = (k) => { const m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(k.body || ""); return !!m && m[1] === m[2] && m[2] === m[3] && parseInt(m[1], 16) >= 0x40 && parseInt(m[1], 16) <= 0x70; };
+let shirtN = 0;
+function lumOf(hex) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex || "");
+  if (!m) return 0.5;
+  const n = parseInt(m[1], 16);
+  return (0.299 * (n >> 16) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) / 255;
+}
+
+// The kit as Wikipedia draws it, put back together inside an isolated (shadow) box and cropped
+// to the shirt: body and both sleeves.
+function wikiShirt(kh, h) {
+  try {
+    const doc = new DOMParser().parseFromString('<div class="mw-parser-output">' + kh.html + "</div>", "text/html");
+    doc.querySelectorAll("script,iframe,object,embed,link,meta,form,input,button,video,audio,style").forEach((n) => n.remove());
+    doc.querySelectorAll("*").forEach((n) => {
+      [...n.attributes].forEach((a) => { if (/^on/i.test(a.name) || /^\s*javascript:/i.test(a.value)) n.removeAttribute(a.name); });
+    });
+    doc.querySelectorAll("a").forEach((a) => a.removeAttribute("href"));
+    const alt = (i) => (i.getAttribute("alt") || "").toLowerCase();
+    const all = [...doc.querySelectorAll('img[alt^="Kit "]')];
+    const has = (el, w) => [...el.querySelectorAll('img[alt^="Kit "]')].some((i) => alt(i).includes(w));
+    if (!all.length) return null;
+    let g = all[0].parentElement;
+    while (g && !(has(g, "body") && has(g, "socks"))) g = g.parentElement;
+    if (!g) g = doc.body.firstElementChild;
+    const parts = ["left arm", "body", "right arm"].map((w) => [...g.querySelectorAll('img[alt^="Kit "]')].find((i) => alt(i).includes(w))).filter(Boolean);
+    if (!parts.length) return null;
+    parts.forEach((p, k) => p.setAttribute("data-ms-part", String(k)));
+    const host = document.createElement("span");
+    host.className = "ms-shirt";
+    host.style.cssText = "display:inline-block;position:relative;overflow:hidden;vertical-align:-7px;margin-right:6px;flex:none;width:" + h + "px;height:" + h + "px;";
+    const root = host.attachShadow({ mode: "open" });
+    const st = document.createElement("style");
+    st.textContent = (kh.css || "") + "\n.ms-inner{position:absolute;left:0;top:0;transform-origin:0 0;width:max-content;pointer-events:none}.ms-inner img{max-width:none}";
+    const inner = document.createElement("div");
+    inner.className = "ms-inner mw-parser-output";
+    inner.appendChild(document.importNode(g, true));
+    root.append(st, inner);
+    const measure = () => {
+      const ps = [...inner.querySelectorAll("[data-ms-part]")];
+      const base = inner.getBoundingClientRect();
+      let x1 = 1e9, y1 = 1e9, x2 = -1e9, y2 = -1e9;
+      ps.forEach((p) => {
+        const r = p.getBoundingClientRect();
+        if (r.width < 1 || r.height < 1) return;
+        x1 = Math.min(x1, r.left - base.left); y1 = Math.min(y1, r.top - base.top);
+        x2 = Math.max(x2, r.right - base.left); y2 = Math.max(y2, r.bottom - base.top);
+      });
+      const sc = inner.style.transform ? parseFloat(/scale\(([\d.]+)/.exec(inner.style.transform)[1]) : 1;
+      if (x2 <= x1 || y2 <= y1) return false;
+      // the rects above already include the current scale
+      const w = (x2 - x1) / sc, hh = (y2 - y1) / sc, ox = x1 / sc, oy = y1 / sc;
+      const s = h / hh;
+      inner.style.transform = "scale(" + s + ") translate(" + -ox + "px," + -oy + "px)";
+      host.style.width = Math.max(8, w * s) + "px";
+      host.dataset.msOk = "1";
+      return true;
+    };
+    inner.addEventListener("load", () => measure(), true);
+    [150, 600, 1500].forEach((t) => setTimeout(measure, t));
+    host.dataset.msWiki = "1";
+    return host;
+  } catch (e) {
+    return null;
+  }
+}
+function shirtEl(kit, plain) {
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", "0 0 28 24");
+  svg.setAttribute("class", "ms-shirt");
+  svg.style.cssText = "width:22px;height:18px;vertical-align:-4px;margin-right:6px;flex:none;display:inline-block;";
+  const id = "msk" + ++shirtN;
+  const body = (kit && kit.body) || plain, la = (kit && kit.la) || plain, ra = (kit && kit.ra) || plain;
+  const mk = (tag, attrs) => { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; };
+  const line = { stroke: "rgba(0,0,0,.55)", "stroke-width": "0.9", "stroke-linejoin": "round" };
+  const bodyD = "M10 2 Q14 6 18 2 L20 3 L20 22 L8 22 L8 3 Z";
+  const clip = mk("clipPath", { id });
+  clip.appendChild(mk("path", { d: bodyD }));
+  svg.appendChild(clip);
+  svg.appendChild(mk("path", Object.assign({ d: "M10 2 L8 3 L2 8 L4.5 12 L8 9.5 Z", fill: la }, line)));
+  svg.appendChild(mk("path", Object.assign({ d: "M18 2 L20 3 L26 8 L23.5 12 L20 9.5 Z", fill: ra }, line)));
+  svg.appendChild(mk("path", { d: bodyD, fill: body }));
+  const pat = (kit && kit.pat) || "";
+  if (/hoop|band/.test(pat) || /stripe|vertical|sash|diagonal|half|halves/.test(pat)) {
+    let col = null;
+    for (const w of Object.keys(SHIRT_WORDS)) if (pat.indexOf(w) >= 0 && SHIRT_WORDS[w] !== body) { col = SHIRT_WORDS[w]; break; }
+    if (!col) col = lumOf(body) > 0.55 ? "#1a1a1a" : "#ffffff";
+    const g = mk("g", { "clip-path": "url(#" + id + ")", fill: col });
+    if (/hoop|band/.test(pat)) for (let y = 5; y < 22; y += 4) g.appendChild(mk("rect", { x: 8, y, width: 12, height: 2 }));
+    else if (/sash|diagonal/.test(pat)) g.appendChild(mk("polygon", { points: "8,4 8,9 20,22 20,17" }));
+    else if (/half/.test(pat)) g.appendChild(mk("rect", { x: 14, y: 0, width: 6, height: 24 }));
+    else for (let x = 9.5; x < 20; x += 4) g.appendChild(mk("rect", { x, y: 0, width: 2, height: 24 }));
+    svg.appendChild(g);
+  }
+  svg.appendChild(mk("path", Object.assign({ d: bodyD, fill: "none" }, line)));
+  return svg;
+}
+function addShirts() {
+  if (disabled || !featureOn("shirts")) return;
+  document.querySelectorAll(".card").forEach((card) => {
+    const pitch = card.querySelector(".pitch");
+    const span = card.querySelector(":scope > .card-header.d-flex span");
+    if (!pitch || !span) return;
+    const name = cleanName(span.textContent);
+    if (!name) return;
+    const colors = new Map(), count = new Map();
+    pitch.querySelectorAll(".player-wrapper").forEach((w) => {
+      const i = w.querySelector(".player-icon i"), a = w.querySelector(".player-achievement");
+      const c = i && i.style.color;
+      if (!c || !a) return;
+      colors.set(a.id, c);
+      count.set(c, (count.get(c) || 0) + 1);
+    });
+    const top = [...count].sort((x, y) => y[1] - x[1])[0];
+    const main = top ? top[0] : "#888";
+    if (!kitCache.has(name)) {
+      kitCache.set(name, "loading");
+      askInfo(name, (info, raw) => { kitCache.set(name, (raw && raw.kit) || null); kitImgCache.set(name, (raw && raw.kitImg) || null); kitHtmlCache.set(name, (raw && raw.kitHtml) || null); addShirts(); });
+    }
+    const kit = kitCache.get(name);
+    card.querySelectorAll("td.player-td").forEach((td) => {
+      const ach = td.querySelector(".player-td-achievements");
+      const own = ach && colors.get(ach.id);
+      const keeper = own && own !== main;
+      const okKit = kit && kit !== "loading" && !keeper && !isPlaceholderKit(kit) ? kit : null;
+      const img = !keeper && kitImgCache.get(name);
+      const useKit = okKit;
+      const wk = !keeper && kitHtmlCache.get(name);
+      const key = (wk ? "w" : img ? "i" + img : useKit ? "k" + JSON.stringify(useKit) : "c") + "|" + (own || main);
+      const cur = td.querySelector(":scope > .ms-shirt");
+      if (cur && cur.dataset.k === key) return;
+      let n = null;
+      if (wk) n = wikiShirt(wk, 24);
+      if (n) { const wn = n, k0 = key, pl = own || main, uk = useKit; setTimeout(() => { if (wn.isConnected && !wn.dataset.msOk) { const f = shirtEl(uk, pl); f.dataset.k = k0; wn.replaceWith(f); } }, 2800); }
+      if (!n) n = shirtEl(useKit, own || main);
+      if (img && !(wk && n.dataset.msWiki)) {
+        const im = document.createElement("img");
+        im.className = "ms-shirt";
+        im.src = img;
+        im.style.cssText = "width:22px;height:22px;object-fit:contain;vertical-align:-6px;margin-right:6px;flex:none;display:inline-block;";
+        im.addEventListener("error", () => { const f = shirtEl(useKit, own || main); f.dataset.k = key; im.replaceWith(f); });
+        n = im;
+      }
+      n.dataset.k = key;
+      const tip = n.dataset.msWiki ? "Home kit as shown on Wikipedia" : img ? "Kit picture from TheSportsDB" : useKit ? "Home kit from Wikipedia" : kit === "loading" ? "Team colour from the pitch" : keeper ? "Goalkeeper colour from the pitch" : "Team colour from the pitch (no kit found on Wikipedia)";
+      n.setAttribute("title", tip);
+      if (!img && !n.dataset.msWiki) { const ti = document.createElementNS("http://www.w3.org/2000/svg", "title"); ti.textContent = tip; n.appendChild(ti); }
+      if (cur) cur.replaceWith(n); else td.insertBefore(n, td.firstChild);
+    });
+    // the players on the pitch: the plain shirt icon is swapped for the kit (not the goalkeeper,
+    // and not when no real kit is known: then the site's own icon stays)
+    pitch.querySelectorAll(".player-wrapper").forEach((w) => {
+      const icon = w.querySelector(".player-icon");
+      const i = icon && icon.querySelector("i");
+      if (!icon || !i) return;
+      const mine = icon.querySelector(":scope > .ms-pshirt");
+      const keeper = i.style.color && i.style.color !== main;
+      const wk = !keeper && kitHtmlCache.get(name);
+      const img = !keeper && kitImgCache.get(name);
+      const pk = wk ? "w" : img ? "i" + img : "";
+      if (pk && icon.dataset.msFail === pk) return;
+      if (!pk) { if (mine) { mine.remove(); i.style.display = ""; delete icon.dataset.msPk; } return; }
+      if (mine && icon.dataset.msPk === pk) { if (i.style.display !== "none") i.style.display = "none"; return; }
+      if (mine) mine.remove();
+      if (!icon.dataset.msSize) {
+        const r = i.getBoundingClientRect();
+        icon.dataset.msSize = String(Math.round(r.height >= 12 ? r.height : 28));
+      }
+      const size = +icon.dataset.msSize;
+      let n = wk ? wikiShirt(wk, size) : null;
+      if (!n && img) {
+        n = document.createElement("img");
+        n.src = img;
+        n.style.cssText = "width:" + size + "px;height:" + size + "px;object-fit:contain;";
+        n.addEventListener("error", () => { n.remove(); i.style.display = ""; icon.dataset.msFail = pk; delete icon.dataset.msPk; });
+      }
+      if (!n) return;
+      n.classList.add("ms-pshirt");
+      n.style.margin = "0 auto";
+      n.style.display = "block";
+      n.style.verticalAlign = "";
+      n.title = n.dataset.msWiki ? "Home kit as shown on Wikipedia" : "Kit picture from TheSportsDB";
+      icon.dataset.msPk = pk;
+      i.style.display = "none";
+      icon.appendChild(n);
+      if (n.dataset.msWiki) setTimeout(() => { if (n.isConnected && !n.dataset.msOk) { n.remove(); i.style.display = ""; icon.dataset.msFail = pk; delete icon.dataset.msPk; } }, 2800);
+    });
+  });
+}
+
 // The lineup tab has no coach line, so one is added under each team's name.
 function processLineupCards() {
   if (disabled || !featureOn("details")) return;
@@ -1392,33 +1594,54 @@ try {
   }
 } catch (e) {}
 
-let timer = null;
+let timer = null, pendingSince = 0, fastTimer = null;
+function fullPass() {
+  detectPremium();
+  scan();
+  fillStadium();
+  processLineupCards();
+  addShirts();
+  fillReferee();
+  updateCoachCards();
+  processEditorPage();
+  reapplyCaptains();
+  updateSuspensionTable();
+  autoVarScan();
+  applyVarToCup();
+  applyVarToStatsPage();
+  applyVarToStandings();
+  fixResultLetters();
+  updateAggregate();
+  if (pageHash()) expireSuspensions(pageHash());
+}
 new MutationObserver(() => {
+  // Full pass: waits for a short quiet moment, but never longer than ~0.9 s in total. A live
+  // page changes all the time, and a plain "wait until quiet" would then never run.
+  const now = Date.now();
   clearTimeout(timer);
-  timer = setTimeout(() => {
-    detectPremium();
-    scan();
-    fillStadium();
-    processLineupCards();
-    fillReferee();
-    updateCoachCards();
-    processEditorPage();
-    reapplyCaptains();
-    updateSuspensionTable();
-    autoVarScan();
-    applyVarToCup();
-    applyVarToStatsPage();
-    applyVarToStandings();
-    fixResultLetters();
-    if (pageHash()) expireSuspensions(pageHash());
-  }, 300);
+  if (!pendingSince) pendingSince = now;
+  timer = setTimeout(() => { pendingSince = 0; try { fullPass(); } catch (e) {} }, Math.max(0, Math.min(300, pendingSince + 900 - now)));
+  // Fast path for the VAR changes: when the site writes a live score again, the lowered score
+  // is put back within ~0.1 s instead of waiting for the full pass (less flicker).
+  if (!fastTimer) {
+    fastTimer = setTimeout(() => {
+      fastTimer = null;
+      if (disabled) return;
+      try { autoVarScan(); varApplyAll(); fixResultLetters(); updateAggregate(); } catch (e) {}
+    }, 120);
+  }
 }).observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["href"] });
+// coming back to the tab (timers sleep in a background tab): catch up straight away
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && !disabled) { try { fullPass(); } catch (e) {} }
+});
+window.addEventListener("focus", () => { if (!disabled) { try { fullPass(); } catch (e) {} } });
 
 // While a cup is being simulated the site updates scores in place, and not every kind of
 // in-place change is seen above, so the VAR changes are also re-checked now and then.
 setInterval(() => {
   if (disabled || document.hidden) return;
-  try { autoVarScan(); varApplyAll(); fixResultLetters(); addCupFormOptions(); claimPending(); } catch (e) {}
+  try { autoVarScan(); varApplyAll(); fixResultLetters(); addCupFormOptions(); claimPending(); addShirts(); eloTrack(); eloPage(); updateAggregate(); } catch (e) {}
 }, 1000);
 
 // ---------- options per cup / per quick match ----------
@@ -1521,6 +1744,7 @@ function buildOptionsBlock(idBase, scope, note) {
   nt.className = "text-xs text-muted mt-1";
   nt.textContent = note;
   wrap.appendChild(nt);
+  wrap._push = push;
   push(); // the defaults count even when nothing is ticked
   const form = () => wrap.closest("form");
   setTimeout(() => { const f = form(); if (f) f.addEventListener("submit", push, true); }, 0);
@@ -1530,6 +1754,18 @@ function buildOptionsBlock(idBase, scope, note) {
 function addCupFormOptions() {
   if (loaded < 6) return;
   const p = location.pathname;
+  // "Create cup from preset" window (cup preset pages and the presets list)
+  const pf = document.getElementById("createCupFromPresetForm");
+  if (pf && !document.getElementById("ms-preset-options")) {
+    const pv = document.getElementById("checkIsPrivate");
+    const anchor = (pv && pv.closest(".form-check")) || [...pf.querySelectorAll(".form-check")].pop();
+    const block = buildOptionsBlock("ms-preset-options", "cup", "Only for this cup. The starting choices come from the settings panel (Alt+Shift+L).");
+    if (anchor) anchor.insertAdjacentElement("afterend", block);
+    else pf.appendChild(block);
+    // the cup is made by a button, not a form submit: keep the choice fresh when it is pressed
+    const start = pf.closest(".modal-content") && pf.closest(".modal-content").querySelector('button[onclick*="createCupFromPreset"]');
+    if (start) start.addEventListener("click", () => block._push && block._push(), true);
+  }
   if (/^\/cup\/new\/?$/.test(p)) {
     if (document.getElementById("ms-cup-options")) return;
     const priv = document.getElementById("inputPrivate");
@@ -2193,6 +2429,31 @@ function applyDelta(el, delta) {
   el.textContent = String(shown);
 }
 
+// wording that means "from the penalty spot"
+const PEN_TEXT = /penalt|spot[- ]?kick|from the spot|the spot\b|twelve[- ]?yard|12[- ]?yard/i;
+// an event of the match data that belongs to a penalty (awarded, scored, missed, saved)
+const PEN_EVENT = /penalt|spot|^pen/i;
+// penalty hint from the match data: the goal itself, or another event close in time, is a penalty event
+function penaltyByEvents(events, goalIdx) {
+  const g = events[goalIdx];
+  if (!g) return false;
+  if (g.penalties_info != null || PEN_EVENT.test(String(g.event))) return true;
+  const m = +g.minute;
+  return events.some((e, i) => i !== goalIdx && e.event !== "goal" && e.event !== "ownGoal" && PEN_EVENT.test(String(e.event)) &&
+    Math.abs((+e.minute || 0) - m) <= 1 && (e.side === g.side || !e.side));
+}
+let pageEventsCache = null;
+function pageEvents() {
+  if (pageEventsCache && pageEventsCache.n === document.scripts.length) return pageEventsCache.ev;
+  let ev = [];
+  for (const sc of document.scripts) {
+    const t = sc.textContent || "";
+    if (t.includes("matchProgress")) { ev = parseMatchEvents(t); if (ev.length) break; }
+  }
+  pageEventsCache = { n: document.scripts.length, ev };
+  return ev;
+}
+
 function isPenaltyGoal(player, minute) {
   const shootout = (() => {
     const ps = document.getElementById("penaltyScore");
@@ -2202,11 +2463,20 @@ function isPenaltyGoal(player, minute) {
   if (shootout && minute >= 120) return true;
   const sur = player.split(" ").pop().toLowerCase();
   const mn = Math.floor(minute);
+  // the match data: a penalty event for this goal (or right before it)
+  try {
+    const ev = pageEvents();
+    const idx = ev.findIndex((e) => (e.event === "goal") && Math.floor(+e.minute) === mn && String(e.player_name || "").toLowerCase().includes(sur));
+    if (idx >= 0 && penaltyByEvents(ev, idx)) return true;
+  } catch (e) {}
+  // the commentary: this minute or the one before (the penalty is awarded, then taken)
   for (const it of document.querySelectorAll("#feedTab .timeline > .timeline-item:not([data-ms-coach])")) {
     const t = minuteValue((it.querySelector(".timeline-item-marker-text") || {}).textContent);
-    if (t === null || Math.floor(t) !== mn) continue;
+    if (t === null) continue;
+    const d = mn - Math.floor(t);
+    if (d < 0 || d > 1) continue;
     const c = (it.querySelector(".timeline-item-content") || it).textContent.toLowerCase();
-    if (/penalt|spot[- ]kick|from the spot/.test(c) && (sur.length < 3 || c.includes(sur))) return true;
+    if (PEN_TEXT.test(c) && (d === 0 || sur.length < 3 || c.includes(sur))) return true;
   }
   return false;
 }
@@ -2479,6 +2749,75 @@ const VARSEEN_KEY = "msVarSeen2";
 const loadSeen = () => { try { return JSON.parse(localStorage.getItem(VARSEEN_KEY) || "{}") || {}; } catch (e) { return {}; } };
 const varInFlight = new Set();
 const retryAt = new Map();
+// ---------- two-legged ties: aggregate and shoot-out after VAR ----------
+// The second leg shows "AGG x-y" and, when the aggregate is level, a penalty shoot-out. When VAR
+// cancels goals (in either leg) the aggregate is recomputed from the first leg (read from the
+// page the AGG label links to) plus the score shown now. If the tie is then no longer level, the
+// shoot-out is hidden and a line says who goes through. (The site itself still moves on with its
+// own result: only the page is changed.)
+let aggState = { hash: "", rec: null, busy: false, retry: 0 };
+function updateAggregate() {
+  if (!featureOn("var")) return;
+  const div = document.getElementById("aggregateScoreDiv");
+  if (!div) return;
+  const link = div.closest("a");
+  const m = link && /\/match\/([0-9a-f]{8,})\//.exec(link.getAttribute("href") || "");
+  if (!m) return;
+  if (aggState.hash !== m[1]) aggState = { hash: m[1], rec: null, busy: false, retry: 0 };
+  if (!aggState.rec) {
+    if (aggState.busy || Date.now() < aggState.retry) return;
+    aggState.busy = true;
+    const st = aggState;
+    evaluateFinishedMatch(m[1], link.getAttribute("href"), cupIdOnPage(), "")
+      .then((rec) => { st.rec = rec || { ho: 0, ao: 0, home: 0, away: 0, ht: "", at: "" }; })
+      .catch(() => { st.retry = Date.now() + 5000; })
+      .then(() => { st.busy = false; });
+    return;
+  }
+  const rec = aggState.rec;
+  const hEl = document.getElementById("homeGoals"), aEl = document.getElementById("awayGoals");
+  if (!hEl || !aEl) return;
+  const num = (e) => (e.dataset.msShown !== undefined && String(+e.textContent) === e.dataset.msShown ? [+e.textContent, +e.dataset.msBase] : [+e.textContent, +e.textContent]);
+  const [curH, rawH] = num(hEl), [curA, rawA] = num(aEl);
+  const cancelled = (rec.home || 0) + (rec.away || 0) + (rawH - curH) + (rawA - curA);
+  const norm = (x) => cleanName(x).toLowerCase();
+  const h2 = norm((document.querySelector(".home-team-name") || {}).textContent), a2 = norm((document.querySelector(".away-team-name") || {}).textContent);
+  const same = !!rec.ht && norm(rec.ht) === h2 && norm(rec.at) === a2; // first leg had the same home team (normally not)
+  const l1 = { h: rec.ho - (rec.home || 0), a: rec.ao - (rec.away || 0) };
+  const aggH = (same ? l1.h : l1.a) + curH, aggA = (same ? l1.a : l1.h) + curA;
+  const noteId = "ms-agg-note";
+  const shoot = document.getElementById("penaltyShootOut"), pscore = document.getElementById("penaltyScore");
+  const siteShootout = !!(shoot && shoot.dataset.msHid !== "1" && !shoot.classList.contains("hidden")) || !!(pscore && pscore.dataset.msHid !== "1" && !pscore.classList.contains("hidden"));
+  const shootHidden = (shoot && shoot.dataset.msHid === "1") || (pscore && pscore.dataset.msHid === "1");
+  let note = document.getElementById(noteId);
+  if (!cancelled) {
+    // nothing changed by VAR: leave the site's own numbers alone (and undo an earlier change)
+    if (div.dataset.msAgg && div.textContent !== div.dataset.msOrig) div.textContent = div.dataset.msOrig;
+    return;
+  }
+  if (div.dataset.msOrig === undefined) div.dataset.msOrig = div.textContent;
+  const want = "AGG " + aggH + "-" + aggA;
+  if (div.textContent !== want) div.textContent = want;
+  div.dataset.msAgg = "1";
+  const awayRule = [...document.scripts].some((sc) => /"away_goal_rule"\s*:\s*1/.test(sc.textContent || ""));
+  const decided = aggH !== aggA && !awayRule;
+  if (decided && (siteShootout || shootHidden)) {
+    [shoot, pscore].forEach((x) => { if (x) { x.dataset.msHid = "1"; x.style.display = "none"; } });
+    const winner = aggH > aggA ? (document.querySelector(".home-team-name") || {}).textContent : (document.querySelector(".away-team-name") || {}).textContent;
+    if (!note) {
+      note = document.createElement("div");
+      note.id = noteId;
+      note.className = "text-center small mt-1";
+      link.insertAdjacentElement("afterend", note);
+    }
+    const t = cleanName(winner) + " go through " + Math.max(aggH, aggA) + "-" + Math.min(aggH, aggA) + " on aggregate after VAR (no shoot-out)";
+    if (note.textContent !== t) note.textContent = t;
+  } else if (!decided) {
+    [shoot, pscore].forEach((x) => { if (x && x.dataset.msHid === "1") { x.dataset.msHid = ""; x.style.display = ""; } });
+    if (note) note.remove();
+  }
+}
+
 function varApplyAll() {
   if (!featureOn("var")) return;
   try { applyVarToCup(); applyVarToStatsPage(); applyVarToStandings(); } catch (e) {}
@@ -2556,6 +2895,9 @@ async function evaluateFinishedMatch(hash, href, cup, shown) {
   const ho = tally("H"), ao = tally("A");
   const rec = { home: 0, away: 0, scorers: [], yellows: [], reds: [], assists: [], ht: names.home, at: names.away, ho, ao, cup };
   if (partial) rec.partial = true;
+  // commentary lines of the page that talk about a penalty (they name the taker)
+  const penChunks = [];
+  for (const mm of html.matchAll(/timeline-item-content">([^<]*)</g)) if (PEN_TEXT.test(mm[1])) penChunks.push(mm[1].toLowerCase());
   const counts = new Map();
   for (const e of events) {
     const kind = e.event === "goal" ? "goal" : e.event === "foulYellow" ? "yellow" : e.event === "foulRed" ? "red" : null;
@@ -2564,7 +2906,10 @@ async function evaluateFinishedMatch(hash, href, cup, shown) {
     const key = side + "|" + kind + "|" + e.player_name;
     const idx = counts.get(key) || 0;
     counts.set(key, idx + 1);
-    const isPen = kind === "goal" && (e.penalties_info != null || e.minute >= 120);
+    const evI = events.indexOf(e);
+    const sur = String(e.player_name).split(" ").pop().toLowerCase();
+    const isPen = kind === "goal" && (e.penalties_info != null || e.minute >= 120 || penaltyByEvents(events, evI) ||
+      (sur.length >= 3 && penChunks.some((c) => c.includes(sur))));
     const { u } = varRoll(hash, side, kind, e.player_name, idx, isPen);
     if (!varOverturned(kind, u)) continue;
     const row = { p: e.player_name, team: names[side] };
@@ -2906,6 +3251,8 @@ const FEATURES = [
   ["logos", "Club logos and nation flags", "The real crests and flags."],
   ["details", "Stadium, manager, captain and referee", "Stadium with place, manager line, captain armband, referee."],
   ["cards", "Coach and bench cards, suspensions", "Cards for managers and unused substitutes, and the bans that follow. (Coach cards need the manager line above.)"],
+  ["elo", "Track Elo ratings", "Keeps the results of finished matches for the Elo ratings page (menu on the left)."],
+  ["shirts", "Shirts in the lineups", "A shirt before every player in the lineup lists (the real kit colours when Wikipedia has them)."],
   ["var", "VAR checks and decisions", "VAR reviews, cancelled goals and cards, and the matching changes in standings and stats."],
 ];
 const computeDisabled = () => settings.mode === "off" || (settings.mode === "auto" && settings.premium === true);
@@ -3173,3 +3520,347 @@ if (DEBUG) {
     );
   }, 4000);
 }
+
+
+// ---------- Elo ratings ----------
+// Finished matches are kept (from the cup pages and match pages you open) and turned into
+// World Football Elo style ratings, separately for nations and clubs. The page itself is drawn
+// inside the site (left menu: "Elo ratings", address ends in #ms-elo).
+//   R_new = R_old + K * G * (W - We), the change rounded to a whole number
+//   G: 1 up to a one goal win, 1.5 for two goals, (11 + N) / 8 for N >= 3
+//   W: 1 win, 0.5 draw (also after a penalty shoot-out), 0 loss
+//   We = 1 / (10^(-dr/400) + 1), dr = rating difference (+ home advantage for the home team)
+const ELO_KEY = "msEloMatches";
+const ELO_CFG_KEY = "msEloCfg";
+const ELO_DEFAULT_CFG = { start: 1500, kCup: 30, kQuick: 20, homeClubs: 100, homeNations: 0, view: "nations" };
+let eloMatches = {}, eloCfg = Object.assign({}, ELO_DEFAULT_CFG), eloLoaded = 0;
+const eloBusy = new Set(), eloRetry = new Map();
+try {
+  chrome.storage.local.get([ELO_KEY, ELO_CFG_KEY], (r) => {
+    eloMatches = (r && r[ELO_KEY]) || {};
+    eloCfg = Object.assign({}, ELO_DEFAULT_CFG, (r && r[ELO_CFG_KEY]) || {});
+    eloLoaded = 1;
+  });
+} catch (e) {}
+
+const eloG = (n) => (n <= 1 ? 1 : n === 2 ? 1.5 : (11 + n) / 8);
+const eloExpected = (dr) => 1 / (Math.pow(10, -dr / 400) + 1);
+
+// ratings and per-team numbers for one kind of team ("nations" or "clubs")
+function eloCompute(matches, cfg, kind) {
+  const nat = kind === "nations";
+  const home = nat ? +cfg.homeNations || 0 : +cfg.homeClubs || 0;
+  const list = Object.values(matches).filter((m) => !!m.nat === nat).sort((a, b) => a.seq - b.seq);
+  const teams = new Map();
+  const get = (n) => {
+    if (!teams.has(n)) teams.set(n, { name: n, r: +cfg.start || 1500, p: 0, w: 0, d: 0, l: 0, gf: 0, ga: 0, last: 0 });
+    return teams.get(n);
+  };
+  const log = [];
+  for (const m of list) {
+    const hg = Math.max(0, m.hg - (m.vh || 0)), ag = Math.max(0, m.ag - (m.va || 0));
+    const h = get(m.hn), a = get(m.an);
+    const W = hg > ag ? 1 : hg < ag ? 0 : 0.5; // a shoot-out win still counts as a draw
+    const K = m.cup ? +cfg.kCup : +cfg.kQuick;
+    const We = eloExpected(h.r - a.r + home);
+    const P = Math.round(K * eloG(Math.abs(hg - ag)) * (W - We));
+    h.r += P; a.r -= P; h.last = P; a.last = -P;
+    h.p++; a.p++; h.gf += hg; h.ga += ag; a.gf += ag; a.ga += hg;
+    if (W === 1) { h.w++; a.l++; } else if (W === 0) { h.l++; a.w++; } else { h.d++; a.d++; }
+    log.push({ m, hg, ag, K, P, hr: h.r, ar: a.r });
+  }
+  return { teams: [...teams.values()].sort((x, y) => y.r - x.r || x.name.localeCompare(y.name)), log };
+}
+
+function eloSave() {
+  try { chrome.storage.local.set({ [ELO_KEY]: eloMatches }); } catch (e) {}
+}
+
+function eloCupId() {
+  const m = /^\/cup\/(?:player-stats\/)?(\d+)/.exec(location.pathname);
+  if (m) return m[1];
+  const a = document.querySelector('main a[href^="/cup/"]');
+  const mm = a && /\/cup\/(?:player-stats\/)?(\d+)/.exec(a.getAttribute("href"));
+  return mm ? mm[1] : "";
+}
+
+async function eloFetchMatch(hash, href, shown, cup, seq) {
+  const res = await fetch(href, { credentials: "same-origin" });
+  if (!res.ok) throw new Error("http " + res.status);
+  const html = await res.text();
+  const events = parseMatchEvents(html);
+  const names = { H: "", A: "" };
+  for (const e of events) if (e.event !== "ownGoal" && e.team_name && (e.side === "H" || e.side === "A") && !names[e.side]) names[e.side] = e.team_name;
+  const fx = fxGet(hash);
+  if (!names.H && fx) names.H = fx[1];
+  if (!names.A && fx) names.A = fx[3];
+  if (!names.H || !names.A) {
+    const t = /<title>\s*([^<|]*?)\s*\|/i.exec(html);
+    const parts = t && t[1].split(" - ");
+    if (parts && parts.length === 2) { names.H = names.H || parts[0].trim(); names.A = names.A || parts[1].trim(); }
+  }
+  if (!names.H || !names.A) return null;
+  const goal = (e) => (e.event === "goal" || e.event === "ownGoal") && e.penalties_info == null;
+  let hg = events.filter((e) => goal(e) && e.side === "H").length;
+  let ag = events.filter((e) => goal(e) && e.side === "A").length;
+  const sm = shown && /^(\d+)-(\d+)$/.exec(shown);
+  if (sm && (+sm[1] !== hg || +sm[2] !== ag)) return null; // still being played: look again soon
+  const hn = stripTag(names.H), an = stripTag(names.A);
+  return {
+    h: hash, hn, an, hg, ag, vh: 0, va: 0,
+    pens: events.some((e) => e.penalties_info != null),
+    cup: cup || "", nat: !!nationCode(hn) && !!nationCode(an), seq, t: Date.now(),
+  };
+}
+
+function eloTrack() {
+  if (disabled || !eloLoaded || !featureOn("elo")) return;
+  const scope = eloCupId();
+  const jobs = [];
+  const queue = (hash, href, shown) => {
+    if (eloMatches[hash] || eloBusy.has(hash) || (eloRetry.get(hash) || 0) > Date.now()) return;
+    jobs.push([hash, href, shown]);
+  };
+  document.querySelectorAll('main a[href*="/match/"]').forEach((a) => {
+    const m = /\/match\/([0-9a-f]{8,})\//.exec(a.getAttribute("href") || "");
+    if (!m) return;
+    const t = origScore(a).replace(/\s+/g, "");
+    if (/^view\s*match$/i.test(origScore(a))) queue(m[1], a.getAttribute("href"), "");
+    else if (/^\d+-\d+$/.test(t)) queue(m[1], a.getAttribute("href"), t);
+  });
+  // the match page being watched counts once it says the match is over
+  const own = pageHash();
+  if (own && /match finished/i.test(document.body.textContent || "")) queue(own, location.pathname, "");
+  const base = Date.now() * 1000;
+  jobs.slice(0, 6 - eloBusy.size).forEach(([hash, href, shown], i) => {
+    eloBusy.add(hash);
+    eloFetchMatch(hash, href, shown, scope, base + i)
+      .then((rec) => {
+        if (!rec) { eloRetry.set(hash, Date.now() + 4000); return; }
+        chrome.storage.local.get(ELO_KEY, (r) => {
+          const all = (r && r[ELO_KEY]) || {};
+          if (!all[hash]) all[hash] = rec;
+          eloMatches = all;
+          eloSave();
+        });
+      })
+      .catch(() => eloRetry.set(hash, Date.now() + 8000))
+      .then(() => eloBusy.delete(hash));
+  });
+  // a goal the VAR cancelled lowers the score the rating is based on
+  let changed = false;
+  const vg = featureOn("var") ? loadVarGoals() : {};
+  for (const h of Object.keys(eloMatches)) {
+    const v = vg[h], m = eloMatches[h];
+    const vh = (v && v.home) || 0, va = (v && v.away) || 0;
+    if (v && (m.vh !== vh || m.va !== va)) { m.vh = vh; m.va = va; changed = true; }
+  }
+  if (changed) eloSave();
+}
+
+// ----- the page -----
+const eloEl = (tag, cls, text) => {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined && text !== null) e.textContent = text;
+  return e;
+};
+
+function addEloLink() {
+  if (disabled || document.getElementById("ms-elo-link")) return;
+  const menu = document.getElementById("accordionSidenav");
+  if (!menu) return;
+  const a = eloEl("a", "nav-link paragraph-1");
+  a.id = "ms-elo-link";
+  a.href = "/home#ms-elo";
+  const ic = eloEl("div", "nav-link-icon");
+  ic.appendChild(eloEl("i", "fas fa-chart-line"));
+  a.append(ic, document.createTextNode(" Elo ratings"));
+  a.addEventListener("click", (e) => {
+    if (location.pathname === "/home") { e.preventDefault(); location.hash = "ms-elo"; eloPage(); }
+  });
+  const nations = menu.querySelector('a[href="/nations"]');
+  if (nations) nations.insertAdjacentElement("afterend", a);
+  else menu.appendChild(a);
+}
+
+function eloPage() {
+  if (disabled) return;
+  addEloLink();
+  const on = location.hash === "#ms-elo";
+  const here = document.getElementById("ms-elo-page");
+  if (!on) { if (here) location.reload(); return; }
+  if (here || !eloLoaded) return;
+  const main = document.querySelector("main");
+  if (!main) return;
+  document.title = "Elo ratings | Match Simulator";
+  const link = document.getElementById("ms-elo-link");
+  if (link) link.classList.add("active");
+  document.querySelectorAll("#accordionSidenav a.active").forEach((x) => { if (x !== link) x.classList.remove("active"); });
+  main.textContent = "";
+  const header = eloEl("header", "page-header page-header-dark bg-gradient-primary-to-secondary pb-10");
+  header.id = "ms-elo-page";
+  const hc = eloEl("div", "container px-4");
+  const hh = eloEl("div", "page-header-content pt-4");
+  const hcol = eloEl("div", "col-auto mt-4");
+  hcol.append(
+    eloEl("h1", "page-header-title", "Elo ratings"),
+    eloEl("div", "page-header-subtitle", "Ratings built from the matches you simulate, the World Football Elo way.")
+  );
+  hh.appendChild(hcol); hc.appendChild(hh); header.appendChild(hc);
+  const wrap = eloEl("div", "container px-4 mt-n10");
+  main.append(header, wrap);
+  renderElo(wrap);
+}
+
+function renderElo(wrap) {
+  wrap.textContent = "";
+  const kind = eloCfg.view === "clubs" ? "clubs" : "nations";
+  const card = eloEl("div", "card mb-4");
+  const body = eloEl("div", "card-body");
+  card.appendChild(body);
+
+  // nations / clubs, tracking switch, search
+  const top = eloEl("div", "d-flex flex-wrap align-items-center gap-3 mb-3");
+  const grp = eloEl("div", "btn-group");
+  [["nations", "Nations"], ["clubs", "Clubs"]].forEach(([k, t]) => {
+    const b = eloEl("button", "btn btn-sm " + (k === kind ? "btn-primary" : "btn-outline-primary"), t);
+    b.type = "button";
+    b.addEventListener("click", () => { eloCfg.view = k; eloSaveCfg(); renderElo(wrap); });
+    grp.appendChild(b);
+  });
+  top.appendChild(grp);
+  const track = eloEl("div", "form-check form-switch mb-0");
+  const tcb = eloEl("input", "form-check-input");
+  tcb.type = "checkbox"; tcb.id = "ms-elo-track"; tcb.checked = featureOn("elo");
+  tcb.addEventListener("change", () => {
+    settings.features = Object.assign({}, settings.features, { elo: tcb.checked });
+    try { chrome.storage.local.set({ msSettings: settings }); } catch (e) {}
+  });
+  const tl = eloEl("label", "form-check-label", "Track Elo ratings (keep results of finished matches)");
+  tl.htmlFor = "ms-elo-track";
+  track.append(tcb, tl);
+  top.appendChild(track);
+  const search = eloEl("input", "form-control form-control-sm");
+  search.placeholder = "Search a team...";
+  search.style.maxWidth = "220px";
+  top.appendChild(search);
+  body.appendChild(top);
+
+  // settings
+  const det = eloEl("details", "mb-3");
+  det.appendChild(eloEl("summary", "small fw-600", "Calculation settings"));
+  const grid = eloEl("div", "row gx-3 mt-2");
+  const field = (label, key, opts) => {
+    const col = eloEl("div", "col-md-3 mb-2");
+    col.appendChild(eloEl("label", "small mb-1", label));
+    let inp;
+    if (opts) {
+      inp = eloEl("select", "form-select form-select-sm");
+      opts.forEach(([v, t]) => { const o = eloEl("option", "", t); o.value = v; if (String(eloCfg[key]) === String(v)) o.selected = true; inp.appendChild(o); });
+    } else {
+      inp = eloEl("input", "form-control form-control-sm");
+      inp.type = "number"; inp.value = eloCfg[key];
+    }
+    inp.addEventListener("change", () => {
+      const v = +inp.value;
+      eloCfg[key] = Number.isFinite(v) ? v : ELO_DEFAULT_CFG[key];
+      eloSaveCfg(); renderElo(wrap);
+    });
+    col.appendChild(inp);
+    grid.appendChild(col);
+  };
+  const ks = [[20, "20 (friendly)"], [30, "30 (other tournaments)"], [40, "40 (qualifiers, major)"], [50, "50 (continental)"], [60, "60 (World Cup)"]];
+  field("Start rating", "start");
+  field("K for cup matches", "kCup", ks);
+  field("K for quick matches", "kQuick", ks);
+  field(kind === "nations" ? "Home advantage (nations)" : "Home advantage (clubs)", kind === "nations" ? "homeNations" : "homeClubs");
+  det.appendChild(grid);
+  det.appendChild(eloEl("div", "text-xs text-muted", "Rating change = K x G x (W - We), rounded. Changes use the score after VAR decisions. Matches are ordered by when the extension first saw them."));
+  body.appendChild(det);
+
+  const { teams, log } = eloCompute(eloMatches, eloCfg, kind);
+  if (!teams.length) {
+    body.appendChild(eloEl("div", "text-muted", featureOn("elo")
+      ? "No finished " + kind + " matches saved yet. Open a cup page or a finished match and the results are picked up."
+      : "Tracking is off. Switch it on above, then open a cup page or a finished match."));
+  }
+
+  const tbl = eloEl("table", "table table-sm align-middle");
+  const thead = eloEl("thead");
+  const hr = eloEl("tr");
+  ["#", "Team", "Elo", "Last", "P", "W", "D", "L", "GF", "GA"].forEach((t) => hr.appendChild(eloEl("th", t === "Team" ? "" : "text-end", t)));
+  thead.appendChild(hr);
+  const tb = eloEl("tbody");
+  tbl.append(thead, tb);
+  const fill = () => {
+    tb.textContent = "";
+    const q = search.value.trim().toLowerCase();
+    teams.forEach((t, i) => {
+      if (q && !t.name.toLowerCase().includes(q)) return;
+      const tr = eloEl("tr");
+      const cells = [i + 1, t.name, t.r, t.last ? (t.last > 0 ? "+" : "") + t.last : "", t.p, t.w, t.d, t.l, t.gf, t.ga];
+      cells.forEach((c, j) => {
+        const td = eloEl("td", j === 1 ? "" : "text-end", c);
+        if (j === 2) td.className = "text-end fw-600";
+        if (j === 3 && t.last) td.className = "text-end " + (t.last > 0 ? "text-success" : "text-danger");
+        tr.appendChild(td);
+      });
+      tb.appendChild(tr);
+    });
+  };
+  search.addEventListener("input", fill);
+  fill();
+  if (teams.length) body.appendChild(eloEl("div", "table-responsive")).appendChild(tbl);
+
+  // recent matches
+  if (log.length) {
+    body.appendChild(eloEl("h5", "mt-4", "Recent matches"));
+    const t2 = eloEl("table", "table table-sm align-middle");
+    const h2 = eloEl("tr");
+    ["Home", "Score", "Away", "K", "Change"].forEach((t, i) => h2.appendChild(eloEl("th", i === 1 || i >= 3 ? "text-center" : "", t)));
+    const th2 = eloEl("thead"); th2.appendChild(h2);
+    const tb2 = eloEl("tbody");
+    log.slice(-20).reverse().forEach((r) => {
+      const tr = eloEl("tr");
+      const sc = r.hg + " - " + r.ag + (r.m.pens && r.hg === r.ag ? " (pens)" : "");
+      [r.m.hn, sc, r.m.an, r.K, (r.P > 0 ? "+" : "") + r.P + " / " + (r.P > 0 ? "-" : r.P < 0 ? "+" : "") + Math.abs(r.P)].forEach((c, i) => {
+        tr.appendChild(eloEl("td", i === 1 || i >= 3 ? "text-center" : "", c));
+      });
+      tb2.appendChild(tr);
+    });
+    t2.append(th2, tb2);
+    body.appendChild(eloEl("div", "table-responsive")).appendChild(t2);
+  }
+
+  // data
+  const act = eloEl("div", "d-flex gap-2 mt-3");
+  const exp = eloEl("button", "btn btn-sm btn-outline-secondary", "Export ratings (CSV)");
+  exp.type = "button";
+  exp.addEventListener("click", () => {
+    const rows = [["rank", "team", "elo", "played", "won", "drawn", "lost", "gf", "ga"]].concat(
+      teams.map((t, i) => [i + 1, t.name, t.r, t.p, t.w, t.d, t.l, t.gf, t.ga])
+    );
+    const csv = rows.map((r) => r.map((v) => '"' + String(v).replace(/"/g, '""') + '"').join(",")).join("\n");
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+    a.download = "elo-" + kind + ".csv";
+    a.click();
+  });
+  const rst = eloEl("button", "btn btn-sm btn-outline-danger", "Delete saved Elo data");
+  rst.type = "button";
+  rst.addEventListener("click", () => {
+    if (!confirm("Delete all saved matches and start the Elo ratings from scratch?")) return;
+    eloMatches = {};
+    try { chrome.storage.local.remove(ELO_KEY); } catch (e) {}
+    renderElo(wrap);
+  });
+  act.append(exp, rst);
+  body.appendChild(act);
+  wrap.appendChild(card);
+}
+
+function eloSaveCfg() {
+  try { chrome.storage.local.set({ [ELO_CFG_KEY]: eloCfg }); } catch (e) {}
+}
+window.addEventListener("hashchange", () => { try { eloPage(); } catch (e) {} });
