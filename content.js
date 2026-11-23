@@ -3613,40 +3613,102 @@ async function eloFetchMatch(hash, href, shown, cup, seq) {
   };
 }
 
-function eloTrack() {
-  if (disabled || !eloLoaded || !featureOn("elo")) return;
-  const scope = eloCupId();
-  const jobs = [];
-  const queue = (hash, href, shown) => {
-    if (eloMatches[hash] || eloBusy.has(hash) || (eloRetry.get(hash) || 0) > Date.now()) return;
-    jobs.push([hash, href, shown]);
-  };
-  document.querySelectorAll('main a[href*="/match/"]').forEach((a) => {
+// the score a fixture link shows: "2-1", also "1-1 (5-3)" after a shoot-out (only the first part counts)
+function eloShown(a) {
+  const t = origScore(a).replace(/\s+/g, " ").trim();
+  if (/^view\s*match$/i.test(t)) return "";
+  const m = /^(\d+)\s*-\s*(\d+)(?:\s*\(.*\))?$/.exec(t);
+  return m ? m[1] + "-" + m[2] : null;
+}
+
+// all finished-match links in a document (the live page or a cup page read in the background)
+function eloQueueLinks(root, cup, jobs) {
+  root.querySelectorAll('a[href*="/match/"]').forEach((a) => {
+    if (a.closest(".dropdown-live-matches")) return; // "Live now": not finished
     const m = /\/match\/([0-9a-f]{8,})\//.exec(a.getAttribute("href") || "");
     if (!m) return;
-    const t = origScore(a).replace(/\s+/g, "");
-    if (/^view\s*match$/i.test(origScore(a))) queue(m[1], a.getAttribute("href"), "");
-    else if (/^\d+-\d+$/.test(t)) queue(m[1], a.getAttribute("href"), t);
+    const hash = m[1];
+    if (eloMatches[hash] || eloBusy.has(hash) || (eloRetry.get(hash) || 0) > Date.now() || jobs.some((j) => j[0] === hash)) return;
+    const shown = eloShown(a);
+    if (shown === null) return;
+    jobs.push([hash, a.getAttribute("href"), shown, cup]);
   });
+}
+
+// cups seen on any page are looked at again in the background, so matches simulated elsewhere
+// (another tab, another round, a cup you did not open) still count
+const ELO_CUPS_KEY = "msEloCups";
+let eloCups = {};
+try { chrome.storage.local.get(ELO_CUPS_KEY, (r) => { eloCups = (r && r[ELO_CUPS_KEY]) || {}; }); } catch (e) {}
+function eloNoteCups(root) {
+  let dirty = false;
+  root.querySelectorAll('a[href^="/cup/"]').forEach((a) => {
+    const href = (a.getAttribute("href") || "").split("?")[0].split("#")[0];
+    const m = /^\/cup\/(\d+)\/[^/]+\/?$/.exec(href);
+    if (m && !eloCups[m[1]]) { eloCups[m[1]] = { href, last: 0, seen: Date.now() }; dirty = true; }
+  });
+  const here = /^\/cup\/(\d+)\/[^/]+/.exec(location.pathname);
+  if (here && !eloCups[here[1]]) { eloCups[here[1]] = { href: "/cup/" + here[1] + "/" + location.pathname.split("/")[3], last: 0, seen: Date.now() }; dirty = true; }
+  if (dirty) {
+    const keys = Object.keys(eloCups).sort((x, y) => eloCups[y].seen - eloCups[x].seen);
+    keys.slice(40).forEach((k) => delete eloCups[k]);
+    try { chrome.storage.local.set({ [ELO_CUPS_KEY]: eloCups }); } catch (e) {}
+  }
+}
+let eloCrawlBusy = false;
+async function eloCrawl(jobs) {
+  if (eloCrawlBusy) return;
+  const due = Object.keys(eloCups).filter((k) => Date.now() - eloCups[k].last > 40000)
+    .sort((x, y) => eloCups[x].last - eloCups[y].last).slice(0, 2);
+  if (!due.length) return;
+  eloCrawlBusy = true;
+  try {
+    for (const id of due) {
+      eloCups[id].last = Date.now();
+      try {
+        const res = await fetch(eloCups[id].href, { credentials: "same-origin" });
+        if (!res.ok) continue;
+        const doc = new DOMParser().parseFromString(await res.text(), "text/html");
+        eloQueueLinks(doc, id, jobs);
+      } catch (e) {}
+    }
+    try { chrome.storage.local.set({ [ELO_CUPS_KEY]: eloCups }); } catch (e) {}
+  } finally { eloCrawlBusy = false; }
+}
+
+let eloLastCrawl = 0;
+function eloTrack() {
+  if (disabled || !eloLoaded || !featureOn("elo")) return;
+  const jobs = [];
+  const cup = eloCupId();
+  eloQueueLinks(document, cup, jobs);
+  eloNoteCups(document);
   // the match page being watched counts once it says the match is over
   const own = pageHash();
-  if (own && /match finished/i.test(document.body.textContent || "")) queue(own, location.pathname, "");
-  const base = Date.now() * 1000;
-  jobs.slice(0, 6 - eloBusy.size).forEach(([hash, href, shown], i) => {
-    eloBusy.add(hash);
-    eloFetchMatch(hash, href, shown, scope, base + i)
-      .then((rec) => {
-        if (!rec) { eloRetry.set(hash, Date.now() + 4000); return; }
-        chrome.storage.local.get(ELO_KEY, (r) => {
-          const all = (r && r[ELO_KEY]) || {};
-          if (!all[hash]) all[hash] = rec;
-          eloMatches = all;
+  if (own && /match finished/i.test(document.body.textContent || "") && !eloMatches[own] && !eloBusy.has(own)) jobs.push([own, location.pathname, "", cup]);
+  const run = () => {
+    const base = Date.now() * 1000;
+    jobs.splice(0, Math.max(0, 6 - eloBusy.size)).forEach(([hash, href, shown, c], i) => {
+      if (eloBusy.has(hash) || eloMatches[hash]) return;
+      eloBusy.add(hash);
+      eloFetchMatch(hash, href, shown, c, base + i)
+        .then((rec) => {
+          if (!rec) { eloRetry.set(hash, Date.now() + 4000); return; }
+          // the in-memory list is the one source (reading the store here would let two matches
+          // that finish together overwrite each other); other tabs arrive through onChanged
+          if (!eloMatches[hash]) eloMatches[hash] = rec;
           eloSave();
-        });
-      })
-      .catch(() => eloRetry.set(hash, Date.now() + 8000))
-      .then(() => eloBusy.delete(hash));
-  });
+          eloRefreshPage();
+        })
+        .catch(() => eloRetry.set(hash, Date.now() + 8000))
+        .then(() => eloBusy.delete(hash));
+    });
+  };
+  run();
+  if (Date.now() - eloLastCrawl > 15000) {
+    eloLastCrawl = Date.now();
+    eloCrawl(jobs).then(run);
+  }
   // a goal the VAR cancelled lowers the score the rating is based on
   let changed = false;
   const vg = featureOn("var") ? loadVarGoals() : {};
@@ -3655,7 +3717,23 @@ function eloTrack() {
     const vh = (v && v.home) || 0, va = (v && v.away) || 0;
     if (v && (m.vh !== vh || m.va !== va)) { m.vh = vh; m.va = va; changed = true; }
   }
-  if (changed) eloSave();
+  if (changed) { eloSave(); eloUi.count = -1; eloRefreshPage(); }
+}
+// keeps running in a background tab too (slowly), and reacts to matches saved by another tab
+setInterval(() => { try { eloTrack(); } catch (e) {} }, 5000);
+try {
+  chrome.storage.onChanged.addListener((ch, area) => {
+    if (area === "local" && ch[ELO_KEY]) { eloMatches = ch[ELO_KEY].newValue || {}; eloRefreshPage(); }
+  });
+} catch (e) {}
+
+let eloUi = { q: "", open: false, count: -1 };
+function eloRefreshPage() {
+  const hdr = document.getElementById("ms-elo-page");
+  const wrap = hdr && hdr.parentElement && hdr.parentElement.querySelector(":scope > .container");
+  const n = Object.keys(eloMatches).length;
+  if (!wrap || n === eloUi.count) return;
+  renderElo(wrap);
 }
 
 // ----- the page -----
@@ -3715,6 +3793,7 @@ function eloPage() {
 
 function renderElo(wrap) {
   wrap.textContent = "";
+  eloUi.count = Object.keys(eloMatches).length;
   const kind = eloCfg.view === "clubs" ? "clubs" : "nations";
   const card = eloEl("div", "card mb-4");
   const body = eloEl("div", "card-body");
@@ -3744,11 +3823,14 @@ function renderElo(wrap) {
   const search = eloEl("input", "form-control form-control-sm");
   search.placeholder = "Search a team...";
   search.style.maxWidth = "220px";
+  search.value = eloUi.q;
   top.appendChild(search);
   body.appendChild(top);
 
   // settings
   const det = eloEl("details", "mb-3");
+  det.open = eloUi.open;
+  det.addEventListener("toggle", () => { eloUi.open = det.open; });
   det.appendChild(eloEl("summary", "small fw-600", "Calculation settings"));
   const grid = eloEl("div", "row gx-3 mt-2");
   const field = (label, key, opts) => {
@@ -3809,7 +3891,7 @@ function renderElo(wrap) {
       tb.appendChild(tr);
     });
   };
-  search.addEventListener("input", fill);
+  search.addEventListener("input", () => { eloUi.q = search.value; fill(); });
   fill();
   if (teams.length) body.appendChild(eloEl("div", "table-responsive")).appendChild(tbl);
 
