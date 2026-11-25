@@ -1443,6 +1443,8 @@ function addShirts() {
     const kit = kitCache.get(name);
     card.querySelectorAll("td.player-td").forEach((td) => {
       const ach = td.querySelector(".player-td-achievements");
+      // bench players (not on the pitch) get no shirt
+      if (colors.size && !(ach && colors.has(ach.id))) { const old = td.querySelector(":scope > .ms-shirt"); if (old) old.remove(); return; }
       const own = ach && colors.get(ach.id);
       const keeper = own && own !== main;
       const okKit = kit && kit !== "loading" && !keeper && !isPlaceholderKit(kit) ? kit : null;
@@ -3524,56 +3526,104 @@ if (DEBUG) {
 
 // ---------- Elo ratings ----------
 // Finished matches are kept (from the cup pages and match pages you open) and turned into
-// World Football Elo style ratings, separately for nations and clubs. The page itself is drawn
-// inside the site (left menu: "Elo ratings", address ends in #ms-elo).
-//   R_new = R_old + K * G * (W - We), the change rounded to a whole number
-//   G: 1 up to a one goal win, 1.5 for two goals, (11 + N) / 8 for N >= 3
-//   W: 1 win, 0.5 draw (also after a penalty shoot-out), 0 loss
-//   We = 1 / (10^(-dr/400) + 1), dr = rating difference (+ home advantage for the home team)
-const ELO_KEY = "msEloMatches";
-const ELO_CFG_KEY = "msEloCfg";
-const ELO_DEFAULT_CFG = { start: 1500, kCup: 30, kQuick: 20, homeClubs: 100, homeNations: 0, view: "nations" };
-let eloMatches = {}, eloCfg = Object.assign({}, ELO_DEFAULT_CFG), eloLoaded = 0;
+// ratings with the FIFA Men's World Ranking method (the "SUM" method used since 2018), separately
+// for nations and clubs. The page is drawn inside the site (left menu: "Elo ratings", address
+// ends in #ms-elo).
+//   P = P_before + I * (W - We)
+//   I  importance of the match (below)
+//   W  1 win, 0.75 win on penalties, 0.5 draw or loss on penalties, 0 loss
+//   We = 1 / (10^(-dr/600) + 1), dr = rating difference (no home advantage, no goal difference)
+//   losses in the knockout stage of a final competition (World Cup / continental finals) cost nothing
+//   second leg of a two-legged tie: a shoot-out is ignored, the second leg counts as played
+//   points are rounded to two decimals
+const ELO_KEY = "msEloMatches2";
+const ELO_CFG_KEY = "msEloCfg2";
+const ELO_IGNORED_KEY = "msEloIgnored";
+// what kind of tournament a cup is: [before the quarter-finals, quarter-finals onwards], and
+// whether a knockout loss is free
+const ELO_KINDS = {
+  wc: ["World Cup (50 / 60, knockout losses are free)", 50, 60, true],
+  conf: ["Continental final competition (35 / 40, knockout losses are free)", 35, 40, true],
+  qual: ["Qualifiers (25)", 25, 25, false],
+  nl: ["Nations League (15 group, 25 play-offs and finals)", 15, 25, false],
+  friendly: ["Friendly tournament (10)", 10, 10, false],
+};
+const ELO_DEFAULT_CFG = { start: 1000, cupKind: "conf", quickI: 10, view: "nations" };
+let eloMatches = {}, eloCfg = Object.assign({}, ELO_DEFAULT_CFG), eloIgnored = {}, eloLoaded = 0;
 const eloBusy = new Set(), eloRetry = new Map();
 try {
-  chrome.storage.local.get([ELO_KEY, ELO_CFG_KEY], (r) => {
+  chrome.storage.local.get([ELO_KEY, ELO_CFG_KEY, ELO_IGNORED_KEY], (r) => {
     eloMatches = (r && r[ELO_KEY]) || {};
     eloCfg = Object.assign({}, ELO_DEFAULT_CFG, (r && r[ELO_CFG_KEY]) || {});
+    eloIgnored = (r && r[ELO_IGNORED_KEY]) || {};
     eloLoaded = 1;
   });
 } catch (e) {}
 
-const eloG = (n) => (n <= 1 ? 1 : n === 2 ? 1.5 : (11 + n) / 8);
-const eloExpected = (dr) => 1 / (Math.pow(10, -dr / 400) + 1);
+const eloExpected = (dr) => 1 / (Math.pow(10, -dr / 600) + 1);
+const r2 = (x) => Math.round(x * 100) / 100;
+// knockout stage, and the quarter-finals onwards, from the match page's stage text
+const eloKnockout = (st) => /quarter|semi|final|third|round of|last \d+|knock|play-?off|1\/\d+/i.test(st || "") && !/group|league phase|matchday/i.test(st || "");
+const eloLate = (st) => /quarter|semi|final|third/i.test(st || "");
+
+// importance of one match
+function eloImportance(m, cfg) {
+  if (!m.cup) return +cfg.quickI || 10;
+  const k = ELO_KINDS[cfg.cupKind] || ELO_KINDS.conf;
+  if (cfg.cupKind === "nl") return eloKnockout(m.st) ? k[2] : k[1];
+  return eloLate(m.st) ? k[2] : k[1];
+}
 
 // ratings and per-team numbers for one kind of team ("nations" or "clubs")
 function eloCompute(matches, cfg, kind) {
   const nat = kind === "nations";
-  const home = nat ? +cfg.homeNations || 0 : +cfg.homeClubs || 0;
   const list = Object.values(matches).filter((m) => !!m.nat === nat).sort((a, b) => a.seq - b.seq);
   const teams = new Map();
   const get = (n) => {
-    if (!teams.has(n)) teams.set(n, { name: n, r: +cfg.start || 1500, p: 0, w: 0, d: 0, l: 0, gf: 0, ga: 0, last: 0 });
+    if (!teams.has(n)) teams.set(n, { name: n, r: +cfg.start || 1000, p: 0, w: 0, d: 0, l: 0, gf: 0, ga: 0, last: 0 });
     return teams.get(n);
   };
   const log = [];
+  const kind0 = ELO_KINDS[cfg.cupKind] || ELO_KINDS.conf;
   for (const m of list) {
     const hg = Math.max(0, m.hg - (m.vh || 0)), ag = Math.max(0, m.ag - (m.va || 0));
     const h = get(m.hn), a = get(m.an);
-    const W = hg > ag ? 1 : hg < ag ? 0 : 0.5; // a shoot-out win still counts as a draw
-    const K = m.cup ? +cfg.kCup : +cfg.kQuick;
-    const We = eloExpected(h.r - a.r + home);
-    const P = Math.round(K * eloG(Math.abs(hg - ag)) * (W - We));
-    h.r += P; a.r -= P; h.last = P; a.last = -P;
+    // result value; the shoot-out only counts when it decided the match (not in a second leg)
+    const shoot = hg === ag && (m.ph || 0) !== (m.pa || 0) && m.mt !== "doubleMatchTwo";
+    let Wh = hg > ag ? 1 : hg < ag ? 0 : 0.5;
+    if (shoot) Wh = m.ph > m.pa ? 0.75 : 0.5;
+    let Wa = hg < ag ? 1 : hg > ag ? 0 : 0.5;
+    if (shoot) Wa = m.pa > m.ph ? 0.75 : 0.5;
+    const I = eloImportance(m, cfg);
+    const Weh = eloExpected(h.r - a.r);
+    let Ph = r2(I * (Wh - Weh)), Pa = r2(I * (Wa - (1 - Weh)));
+    // a loss in the knockout stage of a final competition does not cost points
+    const free = !!m.cup && kind0[3] && eloKnockout(m.st);
+    const lostH = hg < ag || (shoot && m.ph < m.pa), lostA = hg > ag || (shoot && m.pa < m.ph);
+    if (free && lostH && Ph < 0) Ph = 0;
+    if (free && lostA && Pa < 0) Pa = 0;
+    h.r = r2(h.r + Ph); a.r = r2(a.r + Pa); h.last = Ph; a.last = Pa;
     h.p++; a.p++; h.gf += hg; h.ga += ag; a.gf += ag; a.ga += hg;
-    if (W === 1) { h.w++; a.l++; } else if (W === 0) { h.l++; a.w++; } else { h.d++; a.d++; }
-    log.push({ m, hg, ag, K, P, hr: h.r, ar: a.r });
+    if (Wh > Wa) { h.w++; a.l++; } else if (Wh < Wa) { h.l++; a.w++; } else { h.d++; a.d++; }
+    log.push({ m, hg, ag, I, Ph, Pa, shoot });
   }
   return { teams: [...teams.values()].sort((x, y) => y.r - x.r || x.name.localeCompare(y.name)), log };
 }
 
 function eloSave() {
   try { chrome.storage.local.set({ [ELO_KEY]: eloMatches }); } catch (e) {}
+}
+// delete the ratings of nations, clubs or both; the deleted matches are remembered so the
+// background reading does not bring them back
+function eloDelete(kind) {
+  const nat = kind === "nations";
+  for (const h of Object.keys(eloMatches)) {
+    if (kind && !!eloMatches[h].nat !== nat) continue;
+    eloIgnored[h] = 1;
+    delete eloMatches[h];
+  }
+  eloSave();
+  try { chrome.storage.local.set({ [ELO_IGNORED_KEY]: eloIgnored }); } catch (e) {}
 }
 
 function eloCupId() {
@@ -3606,9 +3656,12 @@ async function eloFetchMatch(hash, href, shown, cup, seq) {
   const sm = shown && /^(\d+)-(\d+)$/.exec(shown);
   if (sm && (+sm[1] !== hg || +sm[2] !== ag)) return null; // still being played: look again soon
   const hn = stripTag(names.H), an = stripTag(names.A);
+  const pm = /"penaltiesH"\s*:\s*(\d+)\s*,\s*"penaltiesA"\s*:\s*(\d+)/.exec(html);
+  const mt = /"matchType"\s*:\s*"(\w+)"/.exec(html);
+  const st = /matchday-indicator[^>]*>\s*([^<]*?)\s*</.exec(html);
   return {
     h: hash, hn, an, hg, ag, vh: 0, va: 0,
-    pens: events.some((e) => e.penalties_info != null),
+    ph: pm ? +pm[1] : 0, pa: pm ? +pm[2] : 0, mt: mt ? mt[1] : "", st: st ? st[1] : "",
     cup: cup || "", nat: !!nationCode(hn) && !!nationCode(an), seq, t: Date.now(),
   };
 }
@@ -3628,7 +3681,7 @@ function eloQueueLinks(root, cup, jobs) {
     const m = /\/match\/([0-9a-f]{8,})\//.exec(a.getAttribute("href") || "");
     if (!m) return;
     const hash = m[1];
-    if (eloMatches[hash] || eloBusy.has(hash) || (eloRetry.get(hash) || 0) > Date.now() || jobs.some((j) => j[0] === hash)) return;
+    if (eloMatches[hash] || eloIgnored[hash] || eloBusy.has(hash) || (eloRetry.get(hash) || 0) > Date.now() || jobs.some((j) => j[0] === hash)) return;
     const shown = eloShown(a);
     if (shown === null) return;
     jobs.push([hash, a.getAttribute("href"), shown, cup]);
@@ -3685,11 +3738,11 @@ function eloTrack() {
   eloNoteCups(document);
   // the match page being watched counts once it says the match is over
   const own = pageHash();
-  if (own && /match finished/i.test(document.body.textContent || "") && !eloMatches[own] && !eloBusy.has(own)) jobs.push([own, location.pathname, "", cup]);
+  if (own && /match finished/i.test(document.body.textContent || "") && !eloMatches[own] && !eloIgnored[own] && !eloBusy.has(own)) jobs.push([own, location.pathname, "", cup]);
   const run = () => {
     const base = Date.now() * 1000;
     jobs.splice(0, Math.max(0, 6 - eloBusy.size)).forEach(([hash, href, shown, c], i) => {
-      if (eloBusy.has(hash) || eloMatches[hash]) return;
+      if (eloBusy.has(hash) || eloMatches[hash] || eloIgnored[hash]) return;
       eloBusy.add(hash);
       eloFetchMatch(hash, href, shown, c, base + i)
         .then((rec) => {
@@ -3783,7 +3836,7 @@ function eloPage() {
   const hcol = eloEl("div", "col-auto mt-4");
   hcol.append(
     eloEl("h1", "page-header-title", "Elo ratings"),
-    eloEl("div", "page-header-subtitle", "Ratings built from the matches you simulate, the World Football Elo way.")
+    eloEl("div", "page-header-subtitle", "Ratings built from the matches you simulate, with the FIFA Men's World Ranking method.")
   );
   hh.appendChild(hcol); hc.appendChild(hh); header.appendChild(hc);
   const wrap = eloEl("div", "container px-4 mt-n10");
@@ -3845,20 +3898,18 @@ function renderElo(wrap) {
       inp.type = "number"; inp.value = eloCfg[key];
     }
     inp.addEventListener("change", () => {
-      const v = +inp.value;
-      eloCfg[key] = Number.isFinite(v) ? v : ELO_DEFAULT_CFG[key];
+      const v = opts && key === "cupKind" ? inp.value : +inp.value;
+      eloCfg[key] = v !== "" && (key === "cupKind" || Number.isFinite(v)) ? v : ELO_DEFAULT_CFG[key];
       eloSaveCfg(); renderElo(wrap);
     });
     col.appendChild(inp);
     grid.appendChild(col);
   };
-  const ks = [[20, "20 (friendly)"], [30, "30 (other tournaments)"], [40, "40 (qualifiers, major)"], [50, "50 (continental)"], [60, "60 (World Cup)"]];
   field("Start rating", "start");
-  field("K for cup matches", "kCup", ks);
-  field("K for quick matches", "kQuick", ks);
-  field(kind === "nations" ? "Home advantage (nations)" : "Home advantage (clubs)", kind === "nations" ? "homeNations" : "homeClubs");
+  field("Cup matches count as", "cupKind", Object.entries(ELO_KINDS).map(([k, v]) => [k, v[0]]));
+  field("Quick matches (importance)", "quickI", [[5, "5 (friendly outside the calendar)"], [10, "10 (friendly)"]]);
   det.appendChild(grid);
-  det.appendChild(eloEl("div", "text-xs text-muted", "Rating change = K x G x (W - We), rounded. Changes use the score after VAR decisions. Matches are ordered by when the extension first saw them."));
+  det.appendChild(eloEl("div", "text-xs text-muted", "FIFA Men's World Ranking method: P = P before + I x (W - We). W is 1 for a win, 0.75 for a win on penalties, 0.5 for a draw or a penalty loss, 0 for a loss. We = 1 / (10^(-dr/600) + 1). No home advantage, no goal difference. In a final competition a knockout loss costs nothing. In a second leg the shoot-out is ignored. Scores are the ones after VAR. Matches are ordered by when the extension first saw them."));
   body.appendChild(det);
 
   const { teams, log } = eloCompute(eloMatches, eloCfg, kind);
@@ -3881,7 +3932,7 @@ function renderElo(wrap) {
     teams.forEach((t, i) => {
       if (q && !t.name.toLowerCase().includes(q)) return;
       const tr = eloEl("tr");
-      const cells = [i + 1, t.name, t.r, t.last ? (t.last > 0 ? "+" : "") + t.last : "", t.p, t.w, t.d, t.l, t.gf, t.ga];
+      const cells = [i + 1, t.name, t.r.toFixed(2), t.last ? (t.last > 0 ? "+" : "") + t.last.toFixed(2) : "", t.p, t.w, t.d, t.l, t.gf, t.ga];
       cells.forEach((c, j) => {
         const td = eloEl("td", j === 1 ? "" : "text-end", c);
         if (j === 2) td.className = "text-end fw-600";
@@ -3900,13 +3951,14 @@ function renderElo(wrap) {
     body.appendChild(eloEl("h5", "mt-4", "Recent matches"));
     const t2 = eloEl("table", "table table-sm align-middle");
     const h2 = eloEl("tr");
-    ["Home", "Score", "Away", "K", "Change"].forEach((t, i) => h2.appendChild(eloEl("th", i === 1 || i >= 3 ? "text-center" : "", t)));
+    ["Home", "Score", "Away", "I", "Change"].forEach((t, i) => h2.appendChild(eloEl("th", i === 1 || i >= 3 ? "text-center" : "", t)));
     const th2 = eloEl("thead"); th2.appendChild(h2);
     const tb2 = eloEl("tbody");
     log.slice(-20).reverse().forEach((r) => {
       const tr = eloEl("tr");
-      const sc = r.hg + " - " + r.ag + (r.m.pens && r.hg === r.ag ? " (pens)" : "");
-      [r.m.hn, sc, r.m.an, r.K, (r.P > 0 ? "+" : "") + r.P + " / " + (r.P > 0 ? "-" : r.P < 0 ? "+" : "") + Math.abs(r.P)].forEach((c, i) => {
+      const sc = r.hg + " - " + r.ag + (r.shoot ? " (" + r.m.ph + "-" + r.m.pa + " pens)" : "");
+      const sg = (x) => (x > 0 ? "+" : "") + x.toFixed(2);
+      [r.m.hn, sc, r.m.an, r.I, sg(r.Ph) + " / " + sg(r.Pa)].forEach((c, i) => {
         tr.appendChild(eloEl("td", i === 1 || i >= 3 ? "text-center" : "", c));
       });
       tb2.appendChild(tr);
@@ -3916,7 +3968,7 @@ function renderElo(wrap) {
   }
 
   // data
-  const act = eloEl("div", "d-flex gap-2 mt-3");
+  const act = eloEl("div", "d-flex flex-wrap gap-2 mt-3");
   const exp = eloEl("button", "btn btn-sm btn-outline-secondary", "Export ratings (CSV)");
   exp.type = "button";
   exp.addEventListener("click", () => {
@@ -3929,15 +3981,20 @@ function renderElo(wrap) {
     a.download = "elo-" + kind + ".csv";
     a.click();
   });
-  const rst = eloEl("button", "btn btn-sm btn-outline-danger", "Delete saved Elo data");
-  rst.type = "button";
-  rst.addEventListener("click", () => {
-    if (!confirm("Delete all saved matches and start the Elo ratings from scratch?")) return;
-    eloMatches = {};
-    try { chrome.storage.local.remove(ELO_KEY); } catch (e) {}
-    renderElo(wrap);
-  });
-  act.append(exp, rst);
+  const del = (label, which, text) => {
+    const bt = eloEl("button", "btn btn-sm btn-outline-danger", label);
+    bt.type = "button";
+    bt.addEventListener("click", () => {
+      if (!confirm(text)) return;
+      eloDelete(which);
+      renderElo(wrap);
+    });
+    return bt;
+  };
+  const rst = del("Delete nations Elo", "nations", "Delete the Elo ratings of all nations? Clubs are kept.");
+  const rst2 = del("Delete clubs Elo", "clubs", "Delete the Elo ratings of all clubs? Nations are kept.");
+  const rst3 = del("Delete all Elo data", null, "Delete all Elo ratings (nations and clubs) and start from scratch?");
+  act.append(exp, rst, rst2, rst3);
   body.appendChild(act);
   wrap.appendChild(card);
 }
